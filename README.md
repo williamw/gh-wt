@@ -67,6 +67,14 @@ gh wt add feature-branch --base-branch main
 gh wt add feature-branch -B main
 ```
 
+`--local` creates a branch locally without pushing to origin. Use `-l` as the
+short form:
+
+```bash
+gh wt add feature-branch --local
+gh wt add feature-branch -l
+```
+
 Remove a worktree:
 
 ```bash

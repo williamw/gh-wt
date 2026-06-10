@@ -157,6 +157,7 @@ def cmd_add(args):
     branch = args.branch
     base_branch = args.base_branch
     branch_name = args.branch_name
+    local = args.local
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
@@ -186,18 +187,28 @@ def cmd_add(args):
         sys.exit(1)
 
     if remote_branches:
+        if local:
+            print(f"Error: Branch '{checkout_branch}' already exists on origin. Cannot use --local with an existing remote branch.", file=sys.stderr)
+            sys.exit(1)
         run_git(
             ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{checkout_branch}"],
             cwd=str(bare_dir),
         )
         print(f"Created {folder_name}")
     else:
-        run_git(
-            ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{base_branch}"],
-            cwd=str(bare_dir),
-        )
-        run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
-        print(f"Created {folder_name}")
+        if local:
+            run_git(
+                ["worktree", "add", "-b", checkout_branch, str(worktree_path), base_branch],
+                cwd=str(bare_dir),
+            )
+            print(f"Created {folder_name}")
+        else:
+            run_git(
+                ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{base_branch}"],
+                cwd=str(bare_dir),
+            )
+            run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
+            print(f"Created {folder_name}")
 
 
 def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> None:
@@ -591,6 +602,8 @@ def cli(argv: list[str] | None = None):
                        help="Base branch for new worktrees (default: repo default branch)")
     p_add.add_argument("-b", "--branch-name", default=None,
                        help="Branch name to create or check out (default: branch argument)")
+    p_add.add_argument("-l", "--local", action="store_true",
+                       help="Create branch locally without pushing to origin")
 
     p_rm = subparsers.add_parser("rm", help="Remove a worktree")
     p_rm.add_argument("folder", nargs="?", default=None)
