@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
