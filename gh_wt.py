@@ -231,6 +231,34 @@ def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> No
             sys.exit(1)
 
 
+def parse_worktree_porcelain_paths(output: str) -> list[Path]:
+    """Return registered worktree paths from git worktree porcelain output."""
+    paths = []
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line.removeprefix("worktree ")))
+    return paths
+
+
+def find_stale_worktree_record(folder: str, bare_dir: Path) -> Optional[Path]:
+    """Find a missing registered worktree whose folder name matches the request."""
+    output = run_git(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
+    for registered_path in parse_worktree_porcelain_paths(output):
+        if registered_path.name == folder and not registered_path.exists():
+            return registered_path
+    return None
+
+
+def prune_stale_worktree_record(folder: str, stale_path: Path, bare_dir: Path) -> None:
+    """Prune stale worktree metadata for a missing worktree folder."""
+    print(f"Worktree folder not found, but a stale Git worktree record exists for {folder}.")
+    print("Pruning stale worktree metadata...")
+    prune_output = run_git(["worktree", "prune", "-v"], cwd=str(bare_dir), check=False)
+    if prune_output:
+        print(prune_output)
+    print(f"Removed stale worktree record: {stale_path.name}")
+
+
 def cmd_rm(args):
     """Remove a worktree or all merged worktrees."""
     folder = args.folder
@@ -300,6 +328,11 @@ def cmd_rm(args):
         worktree_path = repo_root / folder
 
         if not worktree_path.exists():
+            stale_path = find_stale_worktree_record(folder, bare_dir)
+            if stale_path:
+                prune_stale_worktree_record(folder, stale_path, bare_dir)
+                return
+
             print(f"Error: Worktree folder not found: {folder}", file=sys.stderr)
             sys.exit(1)
 

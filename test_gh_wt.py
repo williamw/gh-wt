@@ -821,6 +821,48 @@ class TestIsBranchSafeToDelete:
 class TestRemovePreflightChecks:
     """Tests for remove command preflight checks."""
 
+    def test_single_remove_prunes_matching_stale_worktree_record(self, tmp_path: Path) -> None:
+        """Remove should prune stale metadata when the requested folder is already gone."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        stale_path = tmp_path / "deleted-parent" / "feature"
+        porcelain_output = f"worktree {stale_path}\nprunable gitdir file points to non-existent location"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                mock_run_git.side_effect = [
+                    porcelain_output,
+                    "Removing worktrees/feature: gitdir file points to non-existent location",
+                ]
+
+                result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 0
+        assert "stale Git worktree record exists for feature" in result.output
+        assert "Removed stale worktree record: feature" in result.output
+        mock_run_git.assert_any_call(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
+        mock_run_git.assert_any_call(["worktree", "prune", "-v"], cwd=str(bare_dir), check=False)
+        branch_delete_calls = [
+            call for call in mock_run_git.call_args_list
+            if call.args[0][:2] == ["branch", "-D"]
+        ]
+        assert len(branch_delete_calls) == 0
+
+    def test_single_remove_missing_folder_without_stale_record_still_errors(self, tmp_path: Path) -> None:
+        """Remove should keep the existing error when no matching stale record exists."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                mock_run_git.return_value = ""
+
+                result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 1
+        assert "Worktree folder not found: feature" in result.output
+        mock_run_git.assert_called_once_with(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
+
     def test_single_remove_deletes_checked_out_branch_not_folder_name(self, tmp_path: Path) -> None:
         """Remove should resolve the branch checked out in the worktree."""
         bare_dir = tmp_path / ".bare"
