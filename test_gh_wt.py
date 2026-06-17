@@ -551,6 +551,91 @@ class TestAddCommand:
             cwd=str(bare_dir),
         )
 
+    def test_add_runs_executable_setup_hook_with_folder_name(self, tmp_path: Path, monkeypatch) -> None:
+        """Add should run setup-worktree.sh from the invocation directory when executable."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        setup_script = tmp_path / "setup-worktree.sh"
+        setup_script.write_text("#!/bin/sh\n")
+        setup_script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    with patch("gh_wt.subprocess.run") as mock_subprocess_run:
+                        mock_run_git.return_value = ""
+
+                        result = run_cli(["add", "hide-fixed-steps"])
+
+        assert result.exit_code == 0
+        mock_subprocess_run.assert_called_once_with(
+            ["./setup-worktree.sh", "hide-fixed-steps"],
+            cwd=str(tmp_path),
+            check=True,
+        )
+
+    def test_add_skips_missing_setup_hook(self, tmp_path: Path, monkeypatch) -> None:
+        """Add should not require setup-worktree.sh to exist."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    with patch("gh_wt.subprocess.run") as mock_subprocess_run:
+                        mock_run_git.return_value = ""
+
+                        result = run_cli(["add", "feature-branch"])
+
+        assert result.exit_code == 0
+        mock_subprocess_run.assert_not_called()
+
+    def test_add_skips_non_executable_setup_hook(self, tmp_path: Path, monkeypatch) -> None:
+        """Add should only run setup-worktree.sh when it is executable."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        setup_script = tmp_path / "setup-worktree.sh"
+        setup_script.write_text("#!/bin/sh\n")
+        setup_script.chmod(0o644)
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    with patch("gh_wt.subprocess.run") as mock_subprocess_run:
+                        mock_run_git.return_value = ""
+
+                        result = run_cli(["add", "feature-branch"])
+
+        assert result.exit_code == 0
+        mock_subprocess_run.assert_not_called()
+
+    def test_add_exits_nonzero_when_setup_hook_fails(self, tmp_path: Path, monkeypatch) -> None:
+        """Add should fail when an executable setup hook exits non-zero."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        setup_script = tmp_path / "setup-worktree.sh"
+        setup_script.write_text("#!/bin/sh\nexit 7\n")
+        setup_script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    with patch("gh_wt.subprocess.run") as mock_subprocess_run:
+                        mock_run_git.return_value = ""
+                        mock_subprocess_run.side_effect = subprocess.CalledProcessError(
+                            7,
+                            ["./setup-worktree.sh", "feature-branch"],
+                        )
+
+                        result = run_cli(["add", "feature-branch"])
+
+        assert result.exit_code == 7
+        assert "Created feature-branch" not in result.output
+
 
 class TestRemoveMergedFlag:
     """Tests for --merged flag on remove command."""

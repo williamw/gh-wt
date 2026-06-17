@@ -1,5 +1,6 @@
 """GitHub CLI extension for bare-git worktree management."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +34,18 @@ def run_git(args: list[str], cwd: Optional[str] = None, check: bool = True) -> s
 def run_git_result(args: list[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run git command and return the raw completed process."""
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+
+
+def run_setup_worktree_hook(invocation_dir: Path, folder_name: str) -> None:
+    """Run the optional setup hook for a newly created worktree."""
+    setup_script = invocation_dir / "setup-worktree.sh"
+    if not setup_script.is_file() or not os.access(setup_script, os.X_OK):
+        return
+
+    try:
+        subprocess.run(["./setup-worktree.sh", folder_name], cwd=str(invocation_dir), check=True)
+    except subprocess.CalledProcessError as error:
+        sys.exit(error.returncode)
 
 
 def remove_worktree(worktree_path: str, bare_dir: str, force: bool = False) -> None:
@@ -158,6 +171,7 @@ def cmd_add(args):
     base_branch = args.base_branch
     branch_name = args.branch_name
     local = args.local
+    invocation_dir = Path.cwd()
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
@@ -194,21 +208,21 @@ def cmd_add(args):
             ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{checkout_branch}"],
             cwd=str(bare_dir),
         )
-        print(f"Created {folder_name}")
     else:
         if local:
             run_git(
                 ["worktree", "add", "-b", checkout_branch, str(worktree_path), base_branch],
                 cwd=str(bare_dir),
             )
-            print(f"Created {folder_name}")
         else:
             run_git(
                 ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{base_branch}"],
                 cwd=str(bare_dir),
             )
             run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
-            print(f"Created {folder_name}")
+
+    run_setup_worktree_hook(invocation_dir, folder_name)
+    print(f"Created {folder_name}")
 
 
 def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> None:

@@ -75,6 +75,16 @@ gh wt add feature-branch --local
 gh wt add feature-branch -l
 ```
 
+After a worktree is created, `gh wt add` looks in the current directory for an
+executable `setup-worktree.sh` and runs it with the new worktree folder name:
+
+```bash
+./setup-worktree.sh feature-branch
+```
+
+If the setup script exits non-zero, `gh wt add` exits non-zero too. The created
+worktree is left in place.
+
 Remove a worktree:
 
 ```bash
