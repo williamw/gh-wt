@@ -948,6 +948,57 @@ class TestRemovePreflightChecks:
         assert "Worktree folder not found: feature" in result.output
         mock_run_git.assert_called_once_with(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
 
+    def test_single_remove_uses_external_registered_detached_worktree(self, tmp_path: Path) -> None:
+        """Remove should resolve external registered worktrees by folder basename."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        external_path = tmp_path / "outside" / "modcloud-pr1176"
+        external_path.mkdir(parents=True)
+        porcelain_output = f"worktree {external_path}\nHEAD abc123"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                with patch("gh_wt.remove_worktree") as mock_remove_worktree:
+                    mock_run_git.side_effect = [porcelain_output, "HEAD"]
+
+                    result = run_cli(["rm", "modcloud-pr1176"])
+
+        assert result.exit_code == 0
+        assert "Removing modcloud-pr1176 (detached)..." in result.output
+        mock_run_git.assert_any_call(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
+        mock_run_git.assert_any_call(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(external_path),
+        )
+        mock_remove_worktree.assert_called_once_with(str(external_path), str(bare_dir), False)
+        branch_delete_calls = [
+            call for call in mock_run_git.call_args_list
+            if call.args[0][:2] == ["branch", "-D"]
+        ]
+        assert len(branch_delete_calls) == 0
+
+    def test_single_remove_uses_external_registered_branch_worktree(self, tmp_path: Path) -> None:
+        """Remove should preserve branch deletion behavior for external branch worktrees."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        external_path = tmp_path / "outside" / "feature"
+        external_path.mkdir(parents=True)
+        porcelain_output = f"worktree {external_path}\nbranch refs/heads/billw/feature"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.is_branch_safe_to_delete", return_value=True) as mock_safe:
+                with patch("gh_wt.run_git") as mock_run_git:
+                    with patch("gh_wt.remove_worktree") as mock_remove_worktree:
+                        mock_run_git.side_effect = [porcelain_output, "billw/feature", ""]
+
+                        result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 0
+        assert "Removing feature (billw/feature)..." in result.output
+        mock_safe.assert_called_once_with("billw/feature", str(bare_dir))
+        mock_remove_worktree.assert_called_once_with(str(external_path), str(bare_dir), False)
+        mock_run_git.assert_any_call(["branch", "-D", "billw/feature"], cwd=str(bare_dir))
+
     def test_single_remove_deletes_checked_out_branch_not_folder_name(self, tmp_path: Path) -> None:
         """Remove should resolve the branch checked out in the worktree."""
         bare_dir = tmp_path / ".bare"

@@ -112,6 +112,11 @@ If Git refuses to remove a worktree because it contains submodules, `gh wt rm`
 deinitializes submodules in that worktree and retries with `--force` before
 deleting the branch.
 
+`gh wt rm <folder>` can also remove Git-registered worktrees outside the repo
+root, such as temporary worktrees under `/private/tmp`, by matching the folder
+basename shown by `gh wt status`. If that worktree is detached, `gh wt rm`
+removes the worktree only and skips local or remote branch deletion.
+
 If the worktree folder was already deleted but Git still has stale worktree
 metadata for that folder, `gh wt rm <folder>` automatically runs
 `git worktree prune -v` to clear the stale record. This cleanup does not delete

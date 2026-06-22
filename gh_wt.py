@@ -254,11 +254,11 @@ def parse_worktree_porcelain_paths(output: str) -> list[Path]:
     return paths
 
 
-def find_stale_worktree_record(folder: str, bare_dir: Path) -> Optional[Path]:
-    """Find a missing registered worktree whose folder name matches the request."""
+def find_registered_worktree_record(folder: str, bare_dir: Path) -> Optional[Path]:
+    """Find a registered worktree whose folder name matches the request."""
     output = run_git(["worktree", "list", "--porcelain"], cwd=str(bare_dir), check=False)
     for registered_path in parse_worktree_porcelain_paths(output):
-        if registered_path.name == folder and not registered_path.exists():
+        if registered_path.name == folder:
             return registered_path
     return None
 
@@ -342,21 +342,25 @@ def cmd_rm(args):
         worktree_path = repo_root / folder
 
         if not worktree_path.exists():
-            stale_path = find_stale_worktree_record(folder, bare_dir)
-            if stale_path:
-                prune_stale_worktree_record(folder, stale_path, bare_dir)
+            registered_path = find_registered_worktree_record(folder, bare_dir)
+            if registered_path and registered_path.exists():
+                worktree_path = registered_path
+            elif registered_path:
+                prune_stale_worktree_record(folder, registered_path, bare_dir)
                 return
-
-            print(f"Error: Worktree folder not found: {folder}", file=sys.stderr)
-            sys.exit(1)
+            else:
+                print(f"Error: Worktree folder not found: {folder}", file=sys.stderr)
+                sys.exit(1)
 
         branch = run_git(
             ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=str(worktree_path),
         )
         if not branch or branch == "HEAD":
-            print(f"Error: Could not resolve branch for worktree: {folder}", file=sys.stderr)
-            sys.exit(1)
+            print(f"Removing {folder} (detached)...")
+            remove_worktree(str(worktree_path), str(bare_dir), force)
+            print(f"Removed {folder}")
+            return
 
         # Check safety BEFORE removing anything
         if not force and not is_branch_safe_to_delete(branch, str(bare_dir)):
