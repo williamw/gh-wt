@@ -341,6 +341,48 @@ class TestGetDefaultBranchName:
         # Assert: Should strip first 'origin/' only
         assert result == "mr/some-branch"
 
+    def test_falls_back_to_master_when_origin_head_is_missing(self, tmp_path: Path) -> None:
+        """Should use origin/master when origin/HEAD is missing and main does not exist."""
+        # Arrange
+        repo_root = tmp_path / "myrepo"
+        bare_dir = repo_root / ".bare"
+        bare_dir.mkdir(parents=True)
+
+        with patch("gh_wt.run_git") as mock_run_git:
+            mock_run_git.side_effect = ["", "origin/master", ""]
+
+            # Act
+            result = get_default_branch_name(repo_root)
+
+        # Assert
+        assert result == "master"
+        mock_run_git.assert_any_call(
+            ["branch", "-r", "--format=%(refname:short)"],
+            cwd=str(bare_dir),
+            check=False,
+        )
+
+    def test_falls_back_to_local_master_when_origin_head_and_remote_branches_are_missing(self, tmp_path: Path) -> None:
+        """Should use local master in bare clones that do not have remote-tracking refs."""
+        # Arrange
+        repo_root = tmp_path / "myrepo"
+        bare_dir = repo_root / ".bare"
+        bare_dir.mkdir(parents=True)
+
+        with patch("gh_wt.run_git") as mock_run_git:
+            mock_run_git.side_effect = ["", "", "master"]
+
+            # Act
+            result = get_default_branch_name(repo_root)
+
+        # Assert
+        assert result == "master"
+        mock_run_git.assert_any_call(
+            ["branch", "--format=%(refname:short)"],
+            cwd=str(bare_dir),
+            check=False,
+        )
+
     def test_fallbacks_to_main_when_command_fails(self, tmp_path: Path) -> None:
         """Should return 'main' when git command fails."""
         # Arrange
@@ -453,6 +495,34 @@ class TestAddCommand:
                 "billw/FIN-361-webflow-handler",
                 str(tmp_path / "FIN-361-webflow-handler"),
                 "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_add_uses_local_base_branch_when_remote_tracking_ref_is_missing(self, tmp_path: Path) -> None:
+        """Add should work in bare clones where fetched branches live under refs/heads."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        def fake_run_git(args, cwd=None, check=True):
+            if args == ["rev-parse", "--verify", "--quiet", "main"]:
+                return "abc123"
+            return ""
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=fake_run_git) as mock_run_git:
+                    result = run_cli(["add", "billw/DESN-1192-sunset-max-builds"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                "billw/DESN-1192-sunset-max-builds",
+                str(tmp_path / "DESN-1192-sunset-max-builds"),
+                "main",
             ],
             cwd=str(bare_dir),
         )

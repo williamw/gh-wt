@@ -90,7 +90,7 @@ def get_repo_root() -> Optional[Path]:
 
 
 def get_default_branch_name(repo_root: Path) -> str:
-    """Get default branch name from origin/HEAD.
+    """Get default branch name from origin/HEAD, with common branch fallbacks.
     
     Args:
         repo_root: Path to bare repository root (contains .bare/).
@@ -107,9 +107,41 @@ def get_default_branch_name(repo_root: Path) -> str:
         )
         if result.startswith("origin/"):
             return result[7:]
+
+        remote_branches = run_git(
+            ["branch", "-r", "--format=%(refname:short)"],
+            cwd=str(bare_dir),
+            check=False,
+        )
+        remote_branch_names = {
+            branch[7:]
+            for branch in remote_branches.splitlines()
+            if branch.startswith("origin/") and not branch.startswith("origin/HEAD")
+        }
+
+        local_branches = run_git(
+            ["branch", "--format=%(refname:short)"],
+            cwd=str(bare_dir),
+            check=False,
+        )
+        branch_names = remote_branch_names | set(local_branches.splitlines())
+        if "main" in branch_names:
+            return "main"
+        if "master" in branch_names:
+            return "master"
     except Exception:
         pass
     return "main"
+
+
+def get_branch_start_point(bare_dir: Path, branch: str) -> str:
+    """Return a usable start point for a branch in this bare repository."""
+    remote_branch = f"origin/{branch}"
+    if run_git(["rev-parse", "--verify", "--quiet", remote_branch], cwd=str(bare_dir), check=False):
+        return remote_branch
+    if run_git(["rev-parse", "--verify", "--quiet", branch], cwd=str(bare_dir), check=False):
+        return branch
+    return remote_branch
 
 
 def cmd_clone(args):
@@ -215,8 +247,9 @@ def cmd_add(args):
                 cwd=str(bare_dir),
             )
         else:
+            start_point = get_branch_start_point(bare_dir, base_branch)
             run_git(
-                ["worktree", "add", "-b", checkout_branch, str(worktree_path), f"origin/{base_branch}"],
+                ["worktree", "add", "-b", checkout_branch, str(worktree_path), start_point],
                 cwd=str(bare_dir),
             )
             run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
