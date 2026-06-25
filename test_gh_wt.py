@@ -468,6 +468,7 @@ class TestAddCommand:
             ["push", "-u", "origin", "billw/FIN-361-webflow-handler"],
             cwd=str(tmp_path / "FIN-361-webflow-handler"),
         )
+        assert "Worktree created. To use it, run:\n\ncd FIN-361-webflow-handler" in result.output
 
     def test_add_supports_short_branch_name_flag(self, tmp_path: Path) -> None:
         """Add should support -b as shorthand for --branch-name."""

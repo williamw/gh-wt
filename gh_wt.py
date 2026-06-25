@@ -255,7 +255,7 @@ def cmd_add(args):
             run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
 
     run_setup_worktree_hook(invocation_dir, folder_name)
-    print(f"Created {folder_name}")
+    print(f"Worktree created. To use it, run:\n\ncd {folder_name}")
 
 
 def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> None:
