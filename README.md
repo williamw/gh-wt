@@ -93,7 +93,8 @@ gh wt rm feature-branch
 
 `rm` resolves the actual checked-out branch from the worktree before deleting
 the local branch, so the folder name does not need to match the branch name. Add
-`-d` or `--delete-remote` to delete the resolved branch from `origin` too:
+`-d` or `--delete-remote` to delete the resolved branch from `origin` too. If
+the resolved branch is already missing from `origin`, `rm` warns and continues:
 
 ```bash
 gh wt rm feature-branch -d

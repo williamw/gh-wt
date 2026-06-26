@@ -1198,6 +1198,35 @@ class TestRemovePreflightChecks:
             check=False,
         )
 
+    def test_single_remove_delete_remote_warns_when_origin_branch_missing(self, tmp_path: Path) -> None:
+        """Missing origin branch should warn but not fail removal."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree_path = tmp_path / "feature"
+        worktree_path.mkdir()
+
+        def run_git_side_effect(args, **kwargs):
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return "feature"
+            if args == ["rev-parse", "--verify", "--quiet", "refs/remotes/origin/feature"]:
+                return ""
+            return ""
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                with patch("gh_wt.run_git", side_effect=run_git_side_effect) as mock_run_git:
+                    with patch("gh_wt.remove_worktree"):
+                        result = run_cli(["rm", "feature", "-d"])
+
+        assert result.exit_code == 0
+        assert "Warning: Remote branch not found: origin/feature" in result.output
+        assert "Removed feature" in result.output
+        push_calls = [
+            call for call in mock_run_git.call_args_list
+            if call.args[0][:2] == ["push", "origin"]
+        ]
+        assert push_calls == []
+
     def test_single_remove_fails_if_branch_unsafe(self, tmp_path: Path) -> None:
         """Should error and not remove worktree if local branch has unpushed commits."""
         bare_dir = tmp_path / ".bare"

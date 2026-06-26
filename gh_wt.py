@@ -307,6 +307,16 @@ def prune_stale_worktree_record(folder: str, stale_path: Path, bare_dir: Path) -
     print(f"Removed stale worktree record: {stale_path.name}")
 
 
+def delete_remote_branch(branch: str, bare_dir: Path) -> None:
+    """Delete origin branch if it exists; warn and continue when already absent."""
+    remote_ref = f"refs/remotes/origin/{branch}"
+    if not run_git(["rev-parse", "--verify", "--quiet", remote_ref], cwd=str(bare_dir), check=False):
+        print(f"Warning: Remote branch not found: origin/{branch}", file=sys.stderr)
+        return
+
+    run_git(["push", "origin", ":" + branch], cwd=str(bare_dir), check=False)
+
+
 def cmd_rm(args):
     """Remove a worktree or all worktrees with merged or closed PRs."""
     folder = args.folder
@@ -355,7 +365,7 @@ def cmd_rm(args):
 
                 # Optionally delete from remote
                 if delete_remote:
-                    run_git(["push", "origin", ":" + branch], cwd=str(bare_dir), check=False)
+                    delete_remote_branch(branch, bare_dir)
 
                 print(f"Removed {folder_name}")
                 removed_count += 1
@@ -413,7 +423,7 @@ def cmd_rm(args):
 
         # Optionally delete from remote
         if delete_remote:
-            run_git(["push", "origin", ":" + branch], cwd=str(bare_dir), check=False)
+            delete_remote_branch(branch, bare_dir)
 
         print(f"Removed {folder}")
 
