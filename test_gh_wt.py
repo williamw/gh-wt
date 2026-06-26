@@ -733,14 +733,15 @@ class TestRemoveMergedFlag:
         assert result.exit_code != 0
         assert "cannot" in result.output.lower() or "together" in result.output.lower() or "both" in result.output.lower()
 
-    def test_remove_merged_removes_worktrees_with_merged_prs(self, tmp_path: Path) -> None:
-        """--merged should remove all worktrees with merged PRs."""
+    def test_remove_merged_removes_worktrees_with_merged_or_closed_prs(self, tmp_path: Path) -> None:
+        """--merged should remove all worktrees with merged or closed PRs."""
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
 
         # Create worktree directories
         (tmp_path / "feature-1").mkdir()
         (tmp_path / "feature-2").mkdir()
+        (tmp_path / "feature-3").mkdir()
         (tmp_path / "main").mkdir()
 
         with patch("gh_wt.get_repo_root", return_value=tmp_path):
@@ -748,16 +749,18 @@ class TestRemoveMergedFlag:
                 with patch("gh_wt.get_pr_info") as mock_get_pr_info:
                     with patch("gh_wt.run_git") as mock_run_git:
                         with patch("gh_wt.remove_worktree") as mock_remove_worktree:
-                            # Three worktrees
+                            # Four worktrees
                             mock_get_branches.return_value = [
                                 ("feature-1", "feature-1", str(tmp_path / "feature-1")),
                                 ("feature-2", "feature-2", str(tmp_path / "feature-2")),
+                                ("feature-3", "feature-3", str(tmp_path / "feature-3")),
                                 ("main", "main", str(tmp_path / "main")),
                             ]
-                            # feature-1 is merged, feature-2 is open, main has no PR
+                            # feature-1 is merged, feature-2 is closed, feature-3 is open, main has no PR
                             mock_get_pr_info.side_effect = [
                                 {"number": 1, "state": "MERGED", "url": "http://..."},
-                                {"number": 2, "state": "OPEN", "url": "http://..."},
+                                {"number": 2, "state": "CLOSED", "url": "http://..."},
+                                {"number": 3, "state": "OPEN", "url": "http://..."},
                                 None,  # no PR for main
                             ]
 
@@ -765,8 +768,12 @@ class TestRemoveMergedFlag:
 
         assert result.exit_code == 0
         assert "Removing feature-1 (feature-1)..." in result.output
-        mock_remove_worktree.assert_called_once_with(str(tmp_path / "feature-1"), str(bare_dir), False)
+        assert "Removing feature-2 (feature-2)..." in result.output
+        assert mock_remove_worktree.call_count == 2
+        mock_remove_worktree.assert_any_call(str(tmp_path / "feature-1"), str(bare_dir), False)
+        mock_remove_worktree.assert_any_call(str(tmp_path / "feature-2"), str(bare_dir), False)
         mock_run_git.assert_any_call(["branch", "-D", "feature-1"], cwd=str(bare_dir))
+        mock_run_git.assert_any_call(["branch", "-D", "feature-2"], cwd=str(bare_dir))
 
     def test_remove_merged_deletes_local_branch_by_default(self, tmp_path: Path) -> None:
         """--merged should delete local branch by default (no flag needed)."""
@@ -825,8 +832,8 @@ class TestRemoveMergedFlag:
         mock_run_git.assert_any_call(["branch", "-D", "merged-feature"], cwd=str(bare_dir))
         mock_run_git.assert_any_call(["push", "origin", ":" + "merged-feature"], cwd=str(bare_dir), check=False)
 
-    def test_remove_merged_skips_non_merged_worktrees(self, tmp_path: Path) -> None:
-        """--merged should NOT remove worktrees without merged PRs."""
+    def test_remove_merged_skips_open_pr_worktrees(self, tmp_path: Path) -> None:
+        """--merged should NOT remove worktrees with open PRs."""
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
         (tmp_path / "feature").mkdir()
@@ -839,9 +846,8 @@ class TestRemoveMergedFlag:
                             mock_get_branches.return_value = [
                                 ("feature", "feature", str(tmp_path / "feature")),
                             ]
-                            # PR is closed but NOT merged
                             mock_get_pr_info.return_value = {
-                                "number": 1, "state": "CLOSED", "url": "http://..."
+                                "number": 1, "state": "OPEN", "url": "http://..."
                             }
 
                             result = run_cli(["rm", "-m"])

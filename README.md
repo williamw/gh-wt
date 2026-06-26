@@ -99,7 +99,7 @@ the local branch, so the folder name does not need to match the branch name. Add
 gh wt rm feature-branch -d
 ```
 
-Remove all worktrees whose associated pull requests are merged:
+Remove all worktrees whose associated pull requests are merged or closed:
 
 ```bash
 gh wt rm --merged

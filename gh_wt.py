@@ -10,6 +10,7 @@ import argparse
 
 
 SUBMODULE_WORKTREE_ERROR = "working trees containing submodules cannot be moved or removed"
+REMOVABLE_PR_STATES = {"MERGED", "CLOSED"}
 
 
 def run_git(args: list[str], cwd: Optional[str] = None, check: bool = True) -> str:
@@ -307,7 +308,7 @@ def prune_stale_worktree_record(folder: str, stale_path: Path, bare_dir: Path) -
 
 
 def cmd_rm(args):
-    """Remove a worktree or all merged worktrees."""
+    """Remove a worktree or all worktrees with merged or closed PRs."""
     folder = args.folder
     delete_remote = args.delete_remote
     merged = args.merged
@@ -328,7 +329,7 @@ def cmd_rm(args):
     bare_dir = repo_root / ".bare"
 
     if merged:
-        # Remove all worktrees with merged PRs
+        # Remove all worktrees with merged or closed PRs
         worktrees = get_worktree_branches(repo_root)
         removed_count = 0
         skipped_branches = []
@@ -340,7 +341,7 @@ def cmd_rm(args):
 
             # Check PR status
             pr_info = get_pr_info(branch)
-            if pr_info and pr_info.get("state") == "MERGED":
+            if pr_info and pr_info.get("state") in REMOVABLE_PR_STATES:
                 # Check safety BEFORE removing anything
                 if not force and not is_branch_safe_to_delete(branch, str(bare_dir)):
                     skipped_branches.append(branch)
@@ -368,9 +369,9 @@ def cmd_rm(args):
             sys.exit(1)
 
         if removed_count == 0:
-            print("No merged worktrees to remove")
+            print("No merged or closed worktrees to remove")
         else:
-            print(f"Removed {removed_count} merged worktree(s)")
+            print(f"Removed {removed_count} merged or closed worktree(s)")
     else:
         worktree_path = repo_root / folder
 
@@ -694,7 +695,7 @@ def cli(argv: list[str] | None = None):
     p_rm.add_argument("-d", "--delete-remote", action="store_true",
                       help="Also delete the branch from remote origin")
     p_rm.add_argument("-m", "--merged", action="store_true",
-                      help="Remove all worktrees with merged PRs")
+                      help="Remove all worktrees with merged or closed PRs")
     p_rm.add_argument("-f", "--force", action="store_true",
                       help="Force removal even with untracked/unpushed files")
 
