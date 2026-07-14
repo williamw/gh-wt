@@ -37,6 +37,11 @@ Clone a repository into the `.bare/` layout and create the default branch worktr
 gh wt clone owner/repo
 ```
 
+`clone` also writes an executable starter `setup-worktree.sh` into the new repo
+root. By default it drops you into each newly created worktree by `cd`'ing into
+it and starting an interactive shell. Edit it to add project-specific setup, or
+delete it if you do not want the hook to run.
+
 Add a worktree for a branch:
 
 ```bash

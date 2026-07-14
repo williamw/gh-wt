@@ -58,6 +58,10 @@ gh wt --help
   `repo/main` and `repo/feature-x`.
 - **Branch/folder split:** `gh wt add folder --branch-name user/feature`
   lets the worktree folder differ from the branch name.
+- **Clone scaffolds the setup hook:** `gh wt clone` writes an executable starter
+  `setup-worktree.sh` (see `SETUP_WORKTREE_TEMPLATE`) into the repo root that
+  `cd`s into the new worktree and `exec`s a shell. The bare `cd` sticks only
+  because of the `exec`; a subprocess cannot change the parent shell otherwise.
 - **Base branch naming:** `--base-branch` / `-B` selects the source branch for
   new worktrees; do not reintroduce the old `--base` option.
 - **Remove resolves the real branch:** `rm <folder>` inspects the worktree's

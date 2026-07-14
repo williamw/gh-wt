@@ -426,6 +426,28 @@ class TestCloneWorkflow:
         finally:
             os.chdir(original_cwd)
 
+    @patch("gh_wt.subprocess.run")
+    @patch("gh_wt.run_git")
+    def test_clone_writes_executable_setup_worktree_script(self, mock_run_git, mock_subprocess_run, tmp_path: Path) -> None:
+        """Clone should scaffold an executable setup-worktree.sh in the repo root."""
+        import os
+        original_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            mock_run_git.return_value = "main"
+
+            run_cli(["clone", "owner/test-repo"])
+
+            script_path = tmp_path / "test-repo" / "setup-worktree.sh"
+            assert script_path.exists(), "Expected setup-worktree.sh to be created"
+            assert os.access(script_path, os.X_OK), "Expected setup-worktree.sh to be executable"
+
+            contents = script_path.read_text()
+            assert 'target_dir="$script_dir/$worktree"' in contents
+            assert 'exec "${SHELL:-/bin/bash}"' in contents
+        finally:
+            os.chdir(original_cwd)
+
 
 class TestAddCommand:
     """Tests for the add command."""

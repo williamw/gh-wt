@@ -12,6 +12,23 @@ import argparse
 SUBMODULE_WORKTREE_ERROR = "working trees containing submodules cannot be moved or removed"
 REMOVABLE_PR_STATES = {"MERGED", "CLOSED"}
 
+SETUP_WORKTREE_TEMPLATE = """\
+#!/usr/bin/env bash
+set -euo pipefail
+
+worktree=${1%/}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+target_dir="$script_dir/$worktree"
+
+if [[ ! -d "$target_dir" ]]; then
+  echo "Error: $target_dir is not a directory" >&2
+  exit 1
+fi
+
+cd "$target_dir"
+exec "${SHELL:-/bin/bash}"
+"""
+
 
 def run_git(args: list[str], cwd: Optional[str] = None, check: bool = True) -> str:
     """Run git command and return stdout.
@@ -35,6 +52,18 @@ def run_git(args: list[str], cwd: Optional[str] = None, check: bool = True) -> s
 def run_git_result(args: list[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run git command and return the raw completed process."""
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
+
+
+def write_setup_worktree_script(repo_root: Path) -> None:
+    """Write a starter, executable setup-worktree.sh into the repo root.
+
+    The script drops the caller into the newly created worktree by cd'ing into
+    it and exec'ing an interactive shell. `gh wt add` picks it up via
+    run_setup_worktree_hook, which only runs it when it is executable.
+    """
+    script_path = repo_root / "setup-worktree.sh"
+    script_path.write_text(SETUP_WORKTREE_TEMPLATE)
+    script_path.chmod(0o755)
 
 
 def run_setup_worktree_hook(invocation_dir: Path, folder_name: str) -> None:
@@ -185,6 +214,9 @@ def cmd_clone(args):
     )
 
     print(f"Created {repo_root / folder_name}")
+
+    write_setup_worktree_script(repo_root)
+    print(f"Created {repo_root / 'setup-worktree.sh'}")
 
 
 def cmd_list(args):
