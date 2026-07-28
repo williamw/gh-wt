@@ -72,13 +72,30 @@ gh wt add feature-branch --base-branch main
 gh wt add feature-branch -B main
 ```
 
-`--local` creates a branch locally without pushing to origin. Use `-l` as the
-short form:
+`--local` creates a branch locally without pushing to origin. Use `-L` as the
+short form (`-l` now belongs to `--linear`):
 
 ```bash
 gh wt add feature-branch --local
-gh wt add feature-branch -l
+gh wt add feature-branch -L
 ```
+
+`--linear` names the branch from a Linear issue URL. Use `-l` as the short
+form. The issue ID and title slug become the branch name, and a positional
+argument acts as a branch prefix (with or without a trailing slash):
+
+```bash
+gh wt add billw/ -l https://linear.app/modularml/issue/MKT-176/add-redirect-for-mojo-package-submission-page
+# branch: billw/MKT-176-add-redirect-for-mojo-package-submission-page
+# folder: MKT-176-add-redirect-for-mojo-package-submission-page
+
+gh wt add -l https://linear.app/modularml/issue/MKT-176/add-redirect-for-mojo-package-submission-page
+# branch: MKT-176-add-redirect-for-mojo-package-submission-page
+```
+
+A URL without a title slug yields just the issue ID; query strings, fragments,
+and trailing slashes are ignored. `--linear` cannot be combined with
+`--branch-name`, since both control the branch name.
 
 After a worktree is created, `gh wt add` looks in the current directory for an
 executable `setup-worktree.sh` and runs it with the new worktree folder name:

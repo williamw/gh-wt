@@ -21,7 +21,7 @@ gh-wt/
 
 ```bash
 gh wt clone <owner/repo>
-gh wt add <branch-or-folder> [-B|--base-branch <branch>] [-b|--branch-name <branch>]
+gh wt add [<branch-or-folder>] [-B|--base-branch <branch>] [-b|--branch-name <branch>] [-l|--linear <url>] [-L|--local]
 gh wt list
 gh wt status
 gh wt rm <folder> [-d|--delete-remote] [-f|--force]
@@ -64,6 +64,9 @@ gh wt --help
   because of the `exec`; a subprocess cannot change the parent shell otherwise.
 - **Base branch naming:** `--base-branch` / `-B` selects the source branch for
   new worktrees; do not reintroduce the old `--base` option.
+- **Linear owns `-l`:** `--linear` / `-l` names the branch from a Linear issue
+  URL (`parse_linear_issue_url`); `--local` uses `-L`. Do not give `-l` back to
+  `--local`.
 - **Remove resolves the real branch:** `rm <folder>` inspects the worktree's
   checked-out branch before safety checks, branch deletion, and optional remote
   deletion.

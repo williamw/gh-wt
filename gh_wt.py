@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import argparse
 
@@ -164,6 +165,39 @@ def get_default_branch_name(repo_root: Path) -> str:
     return "main"
 
 
+def parse_linear_issue_url(url: str) -> Optional[str]:
+    """Extract a branch-friendly name from a Linear issue URL.
+
+    https://linear.app/modularml/issue/MKT-176/add-redirect-for-page becomes
+    MKT-176-add-redirect-for-page; a URL without a title slug yields just the
+    issue ID. Query strings, fragments, and trailing slashes are ignored.
+
+    Returns None when the URL has no /issue/{id} path.
+    """
+    segments = [segment for segment in urlsplit(url).path.split("/") if segment]
+    if "issue" not in segments:
+        return None
+    after_issue = segments[segments.index("issue") + 1:][:2]
+    if not after_issue:
+        return None
+    return "-".join(after_issue)
+
+
+def resolve_linear_branch(args) -> str:
+    """Resolve the branch name for `add --linear`, exiting on invalid usage."""
+    if args.branch_name:
+        print("Error: Cannot use --linear with --branch-name", file=sys.stderr)
+        sys.exit(1)
+
+    parsed = parse_linear_issue_url(args.linear)
+    if not parsed:
+        print(f"Error: Not a Linear issue URL: {args.linear}", file=sys.stderr)
+        sys.exit(1)
+
+    prefix = (args.branch or "").rstrip("/")
+    return f"{prefix}/{parsed}" if prefix else parsed
+
+
 def get_branch_start_point(bare_dir: Path, branch: str) -> str:
     """Return a usable start point for a branch in this bare repository."""
     remote_branch = f"origin/{branch}"
@@ -237,6 +271,13 @@ def cmd_add(args):
     branch_name = args.branch_name
     local = args.local
     invocation_dir = Path.cwd()
+
+    if args.linear:
+        branch = resolve_linear_branch(args)
+    elif branch is None:
+        print("Error: FOLDER_OR_BRANCH argument is required (unless using --linear/-l)", file=sys.stderr)
+        sys.exit(1)
+
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
@@ -724,12 +765,14 @@ def cli(argv: list[str] | None = None):
 
     p_add = subparsers.add_parser("add", help="Add a worktree for a branch",
                                      allow_abbrev=False)
-    p_add.add_argument("branch", metavar="FOLDER_OR_BRANCH")
+    p_add.add_argument("branch", metavar="FOLDER_OR_BRANCH", nargs="?", default=None)
     p_add.add_argument("-B", "--base-branch", default=None,
                        help="Base branch for new worktrees (default: repo default branch)")
     p_add.add_argument("-b", "--branch-name", default=None,
                        help="Branch name to create or check out (default: branch argument)")
-    p_add.add_argument("-l", "--local", action="store_true",
+    p_add.add_argument("-l", "--linear", default=None, metavar="URL",
+                       help="Name the branch from a Linear issue URL")
+    p_add.add_argument("-L", "--local", action="store_true",
                        help="Create branch locally without pushing to origin")
 
     p_rm = subparsers.add_parser("rm", help="Remove a worktree")

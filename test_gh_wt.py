@@ -1494,3 +1494,258 @@ class TestRemoveWorktreePath:
             remove_worktree_path(worktree_path, bare_dir, False)
 
         assert exc_info.value.code == 1
+
+
+class TestParseLinearIssueUrl:
+    """Tests for parse_linear_issue_url."""
+
+    def test_parses_full_issue_url(self) -> None:
+        """A full issue URL becomes ID-title-slug."""
+        from gh_wt import parse_linear_issue_url
+
+        url = "https://linear.app/modularml/issue/MKT-176/add-redirect-for-mojo-package-submission-page"
+        assert parse_linear_issue_url(url) == "MKT-176-add-redirect-for-mojo-package-submission-page"
+
+    def test_parses_url_without_title_slug(self) -> None:
+        """A URL with only the issue ID yields just the ID."""
+        from gh_wt import parse_linear_issue_url
+
+        assert parse_linear_issue_url("https://linear.app/modularml/issue/MKT-176") == "MKT-176"
+
+    def test_ignores_query_string_and_fragment(self) -> None:
+        """Query strings and fragments copied from the browser are stripped."""
+        from gh_wt import parse_linear_issue_url
+
+        url = "https://linear.app/modularml/issue/MKT-176/add-redirect?noRedirect=1#comment-abc"
+        assert parse_linear_issue_url(url) == "MKT-176-add-redirect"
+
+    def test_ignores_trailing_slash(self) -> None:
+        """A trailing slash does not add an empty segment."""
+        from gh_wt import parse_linear_issue_url
+
+        url = "https://linear.app/modularml/issue/MKT-176/add-redirect/"
+        assert parse_linear_issue_url(url) == "MKT-176-add-redirect"
+
+    def test_accepts_any_team_key_and_digit_count(self) -> None:
+        """Parsing keys off the /issue/ segment, not a team-key pattern."""
+        from gh_wt import parse_linear_issue_url
+
+        assert parse_linear_issue_url("https://linear.app/x/issue/DESN-9/fix") == "DESN-9-fix"
+        assert parse_linear_issue_url("https://linear.app/x/issue/LONGTEAM-123456/t") == "LONGTEAM-123456-t"
+
+    def test_rejects_url_without_issue_segment(self) -> None:
+        """URLs without /issue/{id} are not Linear issue URLs."""
+        from gh_wt import parse_linear_issue_url
+
+        assert parse_linear_issue_url("https://linear.app/modularml") is None
+        assert parse_linear_issue_url("https://linear.app/modularml/issue") is None
+        assert parse_linear_issue_url("not a url") is None
+        assert parse_linear_issue_url("") is None
+
+
+class TestLinearFlag:
+    """Tests for the add --linear/-l flag."""
+
+    HERO_URL = "https://linear.app/modularml/issue/MKT-176/add-redirect-for-mojo-package-submission-page"
+    HERO_NAME = "MKT-176-add-redirect-for-mojo-package-submission-page"
+
+    def test_linear_appends_parsed_name_to_prefix(self, tmp_path: Path) -> None:
+        """`add billw/ -l URL` should create branch billw/{parsed} in folder {parsed}."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    mock_run_git.return_value = ""
+
+                    result = run_cli(["add", "billw/", "-l", self.HERO_URL])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                f"billw/{self.HERO_NAME}",
+                str(tmp_path / self.HERO_NAME),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+        mock_run_git.assert_any_call(
+            ["push", "-u", "origin", f"billw/{self.HERO_NAME}"],
+            cwd=str(tmp_path / self.HERO_NAME),
+        )
+
+    def test_linear_joins_prefix_without_trailing_slash(self, tmp_path: Path) -> None:
+        """`add billw -l URL` should also create branch billw/{parsed}."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    mock_run_git.return_value = ""
+
+                    result = run_cli(["add", "billw", "-l", self.HERO_URL])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                f"billw/{self.HERO_NAME}",
+                str(tmp_path / self.HERO_NAME),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_linear_without_positional_uses_parsed_name_alone(self, tmp_path: Path) -> None:
+        """`add -l URL` should create branch {parsed} with no prefix."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    mock_run_git.return_value = ""
+
+                    result = run_cli(["add", "-l", self.HERO_URL])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                self.HERO_NAME,
+                str(tmp_path / self.HERO_NAME),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_linear_composes_with_base_branch(self, tmp_path: Path) -> None:
+        """`-l` should respect --base-branch for the new worktree's start point."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                mock_run_git.return_value = ""
+
+                result = run_cli(["add", "-l", self.HERO_URL, "-B", "release/candidate"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                self.HERO_NAME,
+                str(tmp_path / self.HERO_NAME),
+                "origin/release/candidate",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_linear_composes_with_local(self, tmp_path: Path) -> None:
+        """`-l` with -L should create the branch without pushing to origin."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    mock_run_git.return_value = ""
+
+                    result = run_cli(["add", "billw/", "-l", self.HERO_URL, "-L"])
+
+        assert result.exit_code == 0
+        pushes = [c for c in mock_run_git.call_args_list if c.args[0][0] == "push"]
+        assert pushes == []
+
+    def test_linear_rejects_branch_name_flag(self, tmp_path: Path) -> None:
+        """`-l` and --branch-name both control the branch name, so they conflict."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                result = run_cli(["add", "-l", self.HERO_URL, "-b", "other-name"])
+
+        assert result.exit_code == 1
+        assert "Error: Cannot use --linear with --branch-name" in result.output
+        mock_run_git.assert_not_called()
+
+    def test_linear_rejects_unparseable_value(self, tmp_path: Path) -> None:
+        """A value without /issue/{id} should fail with a clear error."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                result = run_cli(["add", "billw/", "-l", "https://linear.app/modularml"])
+
+        assert result.exit_code == 1
+        assert "Error: Not a Linear issue URL: https://linear.app/modularml" in result.output
+        mock_run_git.assert_not_called()
+
+    def test_add_requires_positional_without_linear(self, tmp_path: Path) -> None:
+        """Bare `add` should still demand the folder-or-branch argument."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                result = run_cli(["add"])
+
+        assert result.exit_code == 1
+        assert "FOLDER_OR_BRANCH argument is required" in result.output
+        mock_run_git.assert_not_called()
+
+
+class TestLocalShortFlag:
+    """Tests for --local's short flag moving to -L."""
+
+    def test_local_uses_uppercase_short_flag(self, tmp_path: Path) -> None:
+        """`add foo -L` should create the branch locally without pushing."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git") as mock_run_git:
+                    mock_run_git.return_value = ""
+
+                    result = run_cli(["add", "feature-branch", "-L"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                "feature-branch",
+                str(tmp_path / "feature-branch"),
+                "main",
+            ],
+            cwd=str(bare_dir),
+        )
+        pushes = [c for c in mock_run_git.call_args_list if c.args[0][0] == "push"]
+        assert pushes == []
+
+    def test_lowercase_l_no_longer_means_local(self, tmp_path: Path) -> None:
+        """`-l` now takes a URL value; bare `-l` is a usage error."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                result = run_cli(["add", "feature-branch", "-l"])
+
+        assert result.exit_code == 2
+        mock_run_git.assert_not_called()
