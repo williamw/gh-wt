@@ -13,6 +13,11 @@ import argparse
 SUBMODULE_WORKTREE_ERROR = "working trees containing submodules cannot be moved or removed"
 REMOVABLE_PR_STATES = {"MERGED", "CLOSED"}
 
+CONFIG_FILE_NAME = "worktree-config.toml"
+NEW_SETUP_SCRIPT_NAME = "worktree-setup.sh"
+OLD_SETUP_SCRIPT_NAME = "setup-worktree.sh"
+REMOTE_TRACKING_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+
 SETUP_WORKTREE_TEMPLATE = """\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -26,8 +31,8 @@ if [[ ! -d "$target_dir" ]]; then
   exit 1
 fi
 
-cd "$target_dir"
-exec "${SHELL:-/bin/bash}"
+# Add project-specific setup for the new worktree here, e.g.:
+# cp "$script_dir/main/.env.local" "$target_dir/.env.local"
 """
 
 
@@ -55,26 +60,101 @@ def run_git_result(args: list[str], cwd: Optional[str] = None) -> subprocess.Com
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
 
 
-def write_setup_worktree_script(repo_root: Path) -> None:
-    """Write a starter, executable setup-worktree.sh into the repo root.
-
-    The script drops the caller into the newly created worktree by cd'ing into
-    it and exec'ing an interactive shell. `gh wt add` picks it up via
-    run_setup_worktree_hook, which only runs it when it is executable.
-    """
-    script_path = repo_root / "setup-worktree.sh"
-    script_path.write_text(SETUP_WORKTREE_TEMPLATE)
-    script_path.chmod(0o755)
-
-
-def run_setup_worktree_hook(invocation_dir: Path, folder_name: str) -> None:
-    """Run the optional setup hook for a newly created worktree."""
-    setup_script = invocation_dir / "setup-worktree.sh"
-    if not setup_script.is_file() or not os.access(setup_script, os.X_OK):
-        return
+def load_config(repo_root: Path) -> dict:
+    """Read worktree-config.toml from the repo root; empty dict when absent."""
+    config_path = repo_root / CONFIG_FILE_NAME
+    if not config_path.is_file():
+        return {}
 
     try:
-        subprocess.run(["./setup-worktree.sh", folder_name], cwd=str(invocation_dir), check=True)
+        import tomllib
+    except ModuleNotFoundError:
+        print(f"Error: {CONFIG_FILE_NAME} requires Python 3.11 or newer.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        config = tomllib.loads(config_path.read_text())
+    except tomllib.TOMLDecodeError as error:
+        print(f"Error: Cannot parse {CONFIG_FILE_NAME}: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    for key in ("branch-prefix", "setup-script"):
+        if key in config and not isinstance(config[key], str):
+            print(f"Error: Cannot parse {CONFIG_FILE_NAME}: {key} must be a string", file=sys.stderr)
+            sys.exit(1)
+    return config
+
+
+def get_branch_prefix(config: dict) -> str:
+    """Return the configured branch prefix without a trailing slash."""
+    return (config.get("branch-prefix") or "").rstrip("/")
+
+
+def write_config_scaffold(repo_root: Path, script_name: str = NEW_SETUP_SCRIPT_NAME) -> Path:
+    """Write the starter worktree-config.toml into the repo root."""
+    config_path = repo_root / CONFIG_FILE_NAME
+    config_path.write_text(f'setup-script = "{script_name}"\n# branch-prefix = "billw"\n')
+    return config_path
+
+
+def write_setup_worktree_script(repo_root: Path, script_name: str = NEW_SETUP_SCRIPT_NAME) -> Path:
+    """Write a starter, executable setup script into the repo root.
+
+    The starter validates the worktree folder and leaves a commented slot for
+    project-specific setup. `gh wt add` picks it up via
+    run_setup_worktree_hook, which only runs it when it is executable.
+    """
+    script_path = repo_root / script_name
+    script_path.write_text(SETUP_WORKTREE_TEMPLATE)
+    script_path.chmod(0o755)
+    return script_path
+
+
+def resolve_setup_script(repo_root: Path, invocation_dir: Path, config: dict) -> Optional[tuple[Path, Path]]:
+    """Pick the setup script to run and the directory to run it from.
+
+    A configured setup-script resolves relative to the repo root and must be
+    executable. Without the key, both default names are tried in the
+    invocation directory; finding both is an error because the choice is
+    ambiguous.
+    """
+    configured = config.get("setup-script")
+    if configured:
+        script = repo_root / configured
+        if not script.is_file() or not os.access(script, os.X_OK):
+            print(
+                f"Error: setup-script '{configured}' not found or not executable in {repo_root}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return script, repo_root
+
+    new_script = invocation_dir / NEW_SETUP_SCRIPT_NAME
+    old_script = invocation_dir / OLD_SETUP_SCRIPT_NAME
+    if new_script.is_file() and old_script.is_file():
+        print(
+            f"Error: Found both {NEW_SETUP_SCRIPT_NAME} and {OLD_SETUP_SCRIPT_NAME}. "
+            f"Set setup-script in {CONFIG_FILE_NAME} to choose one.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for script in (new_script, old_script):
+        if script.is_file() and os.access(script, os.X_OK):
+            return script, invocation_dir
+    return None
+
+
+def run_setup_worktree_hook(repo_root: Path, invocation_dir: Path, folder_name: str, config: dict) -> None:
+    """Run the optional setup hook for a newly created worktree."""
+    resolved = resolve_setup_script(repo_root, invocation_dir, config)
+    if resolved is None:
+        return
+
+    script, run_dir = resolved
+    sys.stdout.flush()
+    try:
+        subprocess.run([str(script), folder_name], cwd=str(run_dir), check=True)
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
 
@@ -183,6 +263,11 @@ def parse_linear_issue_url(url: str) -> Optional[str]:
     return "-".join(after_issue)
 
 
+def is_linear_issue_url(value: str) -> bool:
+    """True when the value is an http(s) URL that parses as a Linear issue URL."""
+    return urlsplit(value).scheme in ("http", "https") and parse_linear_issue_url(value) is not None
+
+
 def resolve_linear_branch(args) -> str:
     """Resolve the branch name for `add --linear`, exiting on invalid usage."""
     if args.branch_name:
@@ -196,6 +281,50 @@ def resolve_linear_branch(args) -> str:
 
     prefix = (args.branch or "").rstrip("/")
     return f"{prefix}/{parsed}" if prefix else parsed
+
+
+def remote_branch_exists(bare_dir: Path, branch: str) -> bool:
+    """Check whether origin has the branch, via remote-tracking refs."""
+    return bool(run_git(["branch", "-r", "--list", f"origin/{branch}"], cwd=str(bare_dir)))
+
+
+def resolve_prefixed_branch(bare_dir: Path, branch: str, prefix: str) -> tuple[str, bool]:
+    """Pick the branch to check out for a bare name under a configured prefix.
+
+    Prefers an existing remote branch with the prefix, then the bare name,
+    and otherwise names a new prefixed branch.
+
+    Returns:
+        (branch to check out, whether it exists on origin).
+    """
+    prefixed = f"{prefix}/{branch}"
+    if remote_branch_exists(bare_dir, prefixed):
+        print(f"Found origin/{prefixed}")
+        return prefixed, True
+    if remote_branch_exists(bare_dir, branch):
+        return branch, True
+    return prefixed, False
+
+
+def ensure_remote_tracking_refspec(bare_dir: Path) -> bool:
+    """Configure the remote-tracking fetch refspec when origin lacks it.
+
+    Fresh `git clone --bare` repos have no fetch refspec, so `git fetch`
+    never updates refs/remotes/origin/* and remote-branch detection breaks.
+
+    Returns:
+        True when the refspec was added (followed by a fetch).
+    """
+    if not run_git(["config", "--get", "remote.origin.url"], cwd=str(bare_dir), check=False):
+        return False
+
+    existing = run_git(["config", "--get-all", "remote.origin.fetch"], cwd=str(bare_dir), check=False)
+    if REMOTE_TRACKING_REFSPEC in existing.splitlines():
+        return False
+
+    run_git(["config", "remote.origin.fetch", REMOTE_TRACKING_REFSPEC], cwd=str(bare_dir))
+    run_git(["fetch", "origin"], cwd=str(bare_dir), check=False)
+    return True
 
 
 def get_branch_start_point(bare_dir: Path, branch: str) -> str:
@@ -237,6 +366,8 @@ def cmd_clone(args):
         print("  Make sure the repository exists and you have access to it.", file=sys.stderr)
         sys.exit(1)
 
+    ensure_remote_tracking_refspec(bare_dir)
+
     # Get default branch
     default_branch = get_default_branch_name(repo_root)
     folder_name = default_branch.split("/")[-1]
@@ -249,8 +380,111 @@ def cmd_clone(args):
 
     print(f"Created {repo_root / folder_name}")
 
-    write_setup_worktree_script(repo_root)
-    print(f"Created {repo_root / 'setup-worktree.sh'}")
+    script_path = write_setup_worktree_script(repo_root)
+    print(f"Created {script_path}")
+
+    config_path = write_config_scaffold(repo_root)
+    print(f"Created {config_path}")
+
+
+def confirm(prompt: str) -> bool:
+    """Ask a y/N question on stdin; default is no."""
+    return input(prompt).strip().lower() in ("y", "yes")
+
+
+def init_bare_layout(repo_root: Path) -> None:
+    """Adopt an existing bare-layout repo: fix the refspec, scaffold config, migrate the old script name."""
+    refspec_added = ensure_remote_tracking_refspec(repo_root / ".bare")
+    if refspec_added:
+        print("Configured remote fetch refspec and fetched origin.")
+
+    if (repo_root / CONFIG_FILE_NAME).is_file():
+        if not refspec_added:
+            print(f"Nothing to do: {CONFIG_FILE_NAME} already exists.")
+        return
+
+    old_script = repo_root / OLD_SETUP_SCRIPT_NAME
+    script_name = NEW_SETUP_SCRIPT_NAME
+    if old_script.is_file():
+        if confirm(f"Rename {OLD_SETUP_SCRIPT_NAME} to {NEW_SETUP_SCRIPT_NAME}? [y/N] "):
+            old_script.rename(repo_root / NEW_SETUP_SCRIPT_NAME)
+        else:
+            script_name = OLD_SETUP_SCRIPT_NAME
+    elif not (repo_root / NEW_SETUP_SCRIPT_NAME).is_file():
+        script_path = write_setup_worktree_script(repo_root)
+        print(f"Created {script_path}")
+
+    config_path = write_config_scaffold(repo_root, script_name)
+    print(f"Created {config_path}")
+
+
+def remove_checked_out_files(repo_root: Path) -> None:
+    """Delete the old checked-out files; safe because the tree was verified clean."""
+    import shutil
+    for entry in repo_root.iterdir():
+        if entry.name == ".bare":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
+def convert_normal_clone(repo_root: Path) -> None:
+    """Convert a normal clone into the .bare/ + worktree layout, in place.
+
+    The object database moves rather than re-clones, so local branches,
+    stashes, and reflog survive. Requires a fully clean tree because the old
+    checked-out files at the root are deleted after the move.
+    """
+    branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo_root))
+    if branch == "HEAD":
+        print("Error: Cannot convert with a detached HEAD. Check out a branch first.", file=sys.stderr)
+        sys.exit(1)
+
+    if run_git(["status", "--porcelain"], cwd=str(repo_root), check=False):
+        print(
+            "Error: Working tree has uncommitted or untracked files. "
+            "Commit, stash, or remove them, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    folder_name = branch.split("/")[-1]
+    if not confirm(f"Convert this clone to the bare worktree layout (.bare/ + {folder_name}/ worktree)? [y/N] "):
+        return
+
+    bare_dir = repo_root / ".bare"
+    (repo_root / ".git").rename(bare_dir)
+    run_git(["config", "core.bare", "true"], cwd=str(bare_dir))
+    ensure_remote_tracking_refspec(bare_dir)
+    remove_checked_out_files(repo_root)
+    run_git(["worktree", "add", str(repo_root / folder_name), branch], cwd=str(bare_dir))
+
+    print("Converted to bare worktree layout.")
+    print(f"Created {repo_root / folder_name}")
+
+    script_path = write_setup_worktree_script(repo_root)
+    print(f"Created {script_path}")
+
+    config_path = write_config_scaffold(repo_root)
+    print(f"Created {config_path}")
+
+
+def cmd_init(args):
+    """Set up worktree config, migrating old repos or converting normal clones."""
+    repo_root = get_repo_root()
+    if repo_root:
+        init_bare_layout(repo_root)
+        return
+
+    toplevel = run_git(["rev-parse", "--show-toplevel"], check=False)
+    if toplevel:
+        convert_normal_clone(Path(toplevel))
+        return
+
+    print("Error: Not a git repository", file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_list(args):
@@ -266,6 +500,9 @@ def cmd_list(args):
 
 def cmd_add(args):
     """Add a worktree for a branch."""
+    if args.branch and not args.linear and is_linear_issue_url(args.branch):
+        args.linear, args.branch = args.branch, None
+
     branch = args.branch
     base_branch = args.base_branch
     branch_name = args.branch_name
@@ -284,6 +521,8 @@ def cmd_add(args):
         sys.exit(1)
 
     bare_dir = repo_root / ".bare"
+    config = load_config(repo_root)
+    branch_prefix = get_branch_prefix(config)
 
     if base_branch is None:
         base_branch = get_default_branch_name(repo_root)
@@ -291,14 +530,13 @@ def cmd_add(args):
     print("Fetching from origin...")
     run_git(["fetch", "origin"], cwd=str(bare_dir))
 
-    checkout_branch = branch_name or branch
     folder_name = branch if branch_name else branch.split("/")[-1]
 
-    # Check if remote branch exists
-    remote_branches = run_git(
-        ["branch", "-r", "--list", f"origin/{checkout_branch}"],
-        cwd=str(bare_dir),
-    )
+    if branch_prefix and not branch_name and "/" not in branch:
+        checkout_branch, remote_exists = resolve_prefixed_branch(bare_dir, branch, branch_prefix)
+    else:
+        checkout_branch = branch_name or branch
+        remote_exists = remote_branch_exists(bare_dir, checkout_branch)
 
     worktree_path = repo_root / folder_name
 
@@ -306,7 +544,7 @@ def cmd_add(args):
         print(f"Error: Folder already exists: {folder_name}", file=sys.stderr)
         sys.exit(1)
 
-    if remote_branches:
+    if remote_exists:
         if local:
             print(f"Error: Branch '{checkout_branch}' already exists on origin. Cannot use --local with an existing remote branch.", file=sys.stderr)
             sys.exit(1)
@@ -315,6 +553,8 @@ def cmd_add(args):
             cwd=str(bare_dir),
         )
     else:
+        if checkout_branch != (branch_name or args.branch):
+            print(f"Creating branch {checkout_branch}...")
         if local:
             run_git(
                 ["worktree", "add", "-b", checkout_branch, str(worktree_path), base_branch],
@@ -328,8 +568,11 @@ def cmd_add(args):
             )
             run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
 
-    run_setup_worktree_hook(invocation_dir, folder_name)
+    run_setup_worktree_hook(repo_root, invocation_dir, folder_name, config)
     print(f"Worktree created. To use it, run:\n\ncd {folder_name}")
+
+    if not (repo_root / CONFIG_FILE_NAME).is_file() and (invocation_dir / OLD_SETUP_SCRIPT_NAME).is_file():
+        print(f"Hint: found {OLD_SETUP_SCRIPT_NAME}. Run 'gh wt init' to create {CONFIG_FILE_NAME} and migrate.")
 
 
 def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> None:
@@ -761,11 +1004,14 @@ def cli(argv: list[str] | None = None):
     p_clone = subparsers.add_parser("clone", help="Clone a repository with bare layout")
     p_clone.add_argument("repo")
 
+    subparsers.add_parser("init", help="Set up worktree config; converts normal clones to the bare layout")
+
     subparsers.add_parser("list", help="List worktrees")
 
     p_add = subparsers.add_parser("add", help="Add a worktree for a branch",
                                      allow_abbrev=False)
-    p_add.add_argument("branch", metavar="FOLDER_OR_BRANCH", nargs="?", default=None)
+    p_add.add_argument("branch", metavar="FOLDER_OR_BRANCH", nargs="?", default=None,
+                       help="Branch or folder name; a Linear issue URL is detected automatically")
     p_add.add_argument("-B", "--base-branch", default=None,
                        help="Base branch for new worktrees (default: repo default branch)")
     p_add.add_argument("-b", "--branch-name", default=None,
@@ -794,6 +1040,7 @@ def cli(argv: list[str] | None = None):
 
     dispatch = {
         "clone": cmd_clone,
+        "init": cmd_init,
         "list": cmd_list,
         "add": cmd_add,
         "rm": cmd_rm,

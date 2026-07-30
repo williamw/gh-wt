@@ -21,7 +21,8 @@ gh-wt/
 
 ```bash
 gh wt clone <owner/repo>
-gh wt add [<branch-or-folder>] [-B|--base-branch <branch>] [-b|--branch-name <branch>] [-l|--linear <url>] [-L|--local]
+gh wt init
+gh wt add [<branch-or-folder-or-linear-url>] [-B|--base-branch <branch>] [-b|--branch-name <branch>] [-l|--linear <url>] [-L|--local]
 gh wt list
 gh wt status
 gh wt rm <folder> [-d|--delete-remote] [-f|--force]
@@ -59,9 +60,32 @@ gh wt --help
 - **Branch/folder split:** `gh wt add folder --branch-name user/feature`
   lets the worktree folder differ from the branch name.
 - **Clone scaffolds the setup hook:** `gh wt clone` writes an executable starter
-  `setup-worktree.sh` (see `SETUP_WORKTREE_TEMPLATE`) into the repo root that
-  `cd`s into the new worktree and `exec`s a shell. The bare `cd` sticks only
-  because of the `exec`; a subprocess cannot change the parent shell otherwise.
+  `worktree-setup.sh` (see `SETUP_WORKTREE_TEMPLATE`) into the repo root that
+  validates the worktree folder and leaves a commented slot for project setup.
+  It must not `cd`/`exec` into a subshell — the hook runs as a subprocess, so a
+  bare `cd` cannot change the parent shell, and an `exec`'d shell traps
+  non-interactive callers.
+- **Config file is TOML, not YAML:** `worktree-config.toml` in the repo root is
+  parsed with stdlib `tomllib` (Python 3.11+), keeping the extension free of
+  third-party dependencies. Keys: `branch-prefix`, `setup-script`. Missing file
+  means all behavior is unchanged; invalid TOML is a hard error.
+- **Branch-prefix exemption rules:** the prefix applies only to bare names (no
+  `/`) without `--branch-name`; lookup prefers `origin/<prefix>/<name>` over
+  `origin/<name>` (`resolve_prefixed_branch`), else creates `<prefix>/<name>`.
+  A positional prefix in `--linear` mode beats the config prefix.
+- **Setup-script naming transition:** `worktree-setup.sh` is the current name,
+  `setup-worktree.sh` the legacy one. A configured `setup-script` resolves from
+  the repo root and must be executable (hard error otherwise); without the key,
+  both defaults are tried in the invocation dir and finding both is an error.
+- **`init` migrates and converts:** in a bare layout it fixes the fetch refspec
+  and scaffolds config (offering the script rename); in a normal clone it
+  converts in place (`.git` → `.bare`) after requiring a fully clean tree, so
+  local branches, stashes, and reflog survive. Prompts (`confirm`) live only in
+  `init` — `add` must stay non-interactive.
+- **Fetch refspec is managed:** `git clone --bare` writes no fetch refspec, so
+  remote-tracking refs never update. `ensure_remote_tracking_refspec` installs
+  `+refs/heads/*:refs/remotes/origin/*` in `clone` and `init`; remote-branch
+  detection assumes it.
 - **Base branch naming:** `--base-branch` / `-B` selects the source branch for
   new worktrees; do not reintroduce the old `--base` option.
 - **Linear owns `-l`:** `--linear` / `-l` names the branch from a Linear issue

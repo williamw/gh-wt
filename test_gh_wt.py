@@ -429,7 +429,7 @@ class TestCloneWorkflow:
     @patch("gh_wt.subprocess.run")
     @patch("gh_wt.run_git")
     def test_clone_writes_executable_setup_worktree_script(self, mock_run_git, mock_subprocess_run, tmp_path: Path) -> None:
-        """Clone should scaffold an executable setup-worktree.sh in the repo root."""
+        """Clone should scaffold an executable worktree-setup.sh in the repo root."""
         import os
         original_cwd = os.getcwd()
         try:
@@ -438,13 +438,13 @@ class TestCloneWorkflow:
 
             run_cli(["clone", "owner/test-repo"])
 
-            script_path = tmp_path / "test-repo" / "setup-worktree.sh"
-            assert script_path.exists(), "Expected setup-worktree.sh to be created"
-            assert os.access(script_path, os.X_OK), "Expected setup-worktree.sh to be executable"
+            script_path = tmp_path / "test-repo" / "worktree-setup.sh"
+            assert script_path.exists(), "Expected worktree-setup.sh to be created"
+            assert os.access(script_path, os.X_OK), "Expected worktree-setup.sh to be executable"
 
             contents = script_path.read_text()
             assert 'target_dir="$script_dir/$worktree"' in contents
-            assert 'exec "${SHELL:-/bin/bash}"' in contents
+            assert "exec" not in contents, "Starter script must not drop into a subshell"
         finally:
             os.chdir(original_cwd)
 
@@ -663,7 +663,7 @@ class TestAddCommand:
 
         assert result.exit_code == 0
         mock_subprocess_run.assert_called_once_with(
-            ["./setup-worktree.sh", "hide-fixed-steps"],
+            [str(setup_script), "hide-fixed-steps"],
             cwd=str(tmp_path),
             check=True,
         )
@@ -1749,3 +1749,468 @@ class TestLocalShortFlag:
 
         assert result.exit_code == 2
         mock_run_git.assert_not_called()
+
+
+class TestLoadConfig:
+    """Tests for worktree-config.toml loading."""
+
+    def test_missing_config_returns_empty_dict(self, tmp_path: Path) -> None:
+        """A repo without a config file behaves as fully unconfigured."""
+        from gh_wt import load_config
+
+        assert load_config(tmp_path) == {}
+
+    def test_reads_branch_prefix_and_setup_script(self, tmp_path: Path) -> None:
+        """Both supported keys should come back as written."""
+        from gh_wt import load_config
+
+        (tmp_path / "worktree-config.toml").write_text(
+            'branch-prefix = "billw"\nsetup-script = "worktree-setup.sh"\n'
+        )
+
+        config = load_config(tmp_path)
+
+        assert config["branch-prefix"] == "billw"
+        assert config["setup-script"] == "worktree-setup.sh"
+
+    def test_invalid_toml_exits_with_parse_error(self, tmp_path: Path, capsys) -> None:
+        """Broken TOML should fail loudly, never be silently ignored."""
+        from gh_wt import load_config
+
+        (tmp_path / "worktree-config.toml").write_text("branch-prefix = [unclosed\n")
+
+        with pytest.raises(SystemExit) as excinfo:
+            load_config(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert "Error: Cannot parse worktree-config.toml" in capsys.readouterr().err
+
+    def test_non_string_value_exits_with_parse_error(self, tmp_path: Path, capsys) -> None:
+        """Known keys must be strings."""
+        from gh_wt import load_config
+
+        (tmp_path / "worktree-config.toml").write_text("branch-prefix = 7\n")
+
+        with pytest.raises(SystemExit) as excinfo:
+            load_config(tmp_path)
+
+        assert excinfo.value.code == 1
+        assert "branch-prefix must be a string" in capsys.readouterr().err
+
+    def test_unknown_keys_are_ignored(self, tmp_path: Path) -> None:
+        """Unknown keys pass through without complaint (forward compatibility)."""
+        from gh_wt import load_config
+
+        (tmp_path / "worktree-config.toml").write_text('future-option = "whatever"\n')
+
+        assert load_config(tmp_path)["future-option"] == "whatever"
+
+
+def make_remote_listing_run_git(listings: dict[str, str]):
+    """Fake run_git that answers `branch -r --list` from a lookup table."""
+    def fake_run_git(args, cwd=None, check=True):
+        if args[:3] == ["branch", "-r", "--list"]:
+            return listings.get(args[3], "")
+        return ""
+    return fake_run_git
+
+
+class TestBranchPrefix:
+    """Tests for the config branch-prefix rules in add."""
+
+    def write_prefix_config(self, repo_root: Path) -> None:
+        (repo_root / "worktree-config.toml").write_text('branch-prefix = "billw"\n')
+
+    def test_prefixes_new_branch_from_bare_name(self, tmp_path: Path) -> None:
+        """`add foo` should create billw/foo in a folder named foo."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "foo"])
+
+        assert result.exit_code == 0
+        assert "Creating branch billw/foo..." in result.output
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "billw/foo", str(tmp_path / "foo"), "origin/main"],
+            cwd=str(bare_dir),
+        )
+        mock_run_git.assert_any_call(
+            ["push", "-u", "origin", "billw/foo"],
+            cwd=str(tmp_path / "foo"),
+        )
+
+    def test_prefers_existing_prefixed_remote_branch(self, tmp_path: Path) -> None:
+        """`add foo` should check out origin/billw/foo when it exists."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+        listings = {"origin/billw/foo": "origin/billw/foo"}
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git(listings)) as mock_run_git:
+                    result = run_cli(["add", "foo"])
+
+        assert result.exit_code == 0
+        assert "Found origin/billw/foo" in result.output
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "billw/foo", str(tmp_path / "foo"), "origin/billw/foo"],
+            cwd=str(bare_dir),
+        )
+
+    def test_falls_back_to_unprefixed_remote_branch(self, tmp_path: Path) -> None:
+        """`add foo` should still check out origin/foo when only it exists."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+        listings = {"origin/foo": "origin/foo"}
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git(listings)) as mock_run_git:
+                    result = run_cli(["add", "foo"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "foo", str(tmp_path / "foo"), "origin/foo"],
+            cwd=str(bare_dir),
+        )
+
+    def test_branch_with_slash_is_used_verbatim(self, tmp_path: Path) -> None:
+        """Names containing '/' are full branch names; the prefix never applies."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "colleague/fix"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "colleague/fix", str(tmp_path / "fix"), "origin/main"],
+            cwd=str(bare_dir),
+        )
+
+    def test_explicit_branch_name_is_used_verbatim(self, tmp_path: Path) -> None:
+        """-b values are exact; the prefix never applies."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "myfolder", "-b", "exact-name"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "exact-name", str(tmp_path / "myfolder"), "origin/main"],
+            cwd=str(bare_dir),
+        )
+
+    def test_prefix_applies_to_linear_branch_names(self, tmp_path: Path) -> None:
+        """Linear-derived names without a positional prefix get the config prefix."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "-l", "https://linear.app/modularml/issue/MKT-176/add-redirect"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                "billw/MKT-176-add-redirect",
+                str(tmp_path / "MKT-176-add-redirect"),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_positional_linear_prefix_beats_config_prefix(self, tmp_path: Path) -> None:
+        """`add teamx -l <url>` keeps the positional prefix."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        self.write_prefix_config(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "teamx", "-l", "https://linear.app/modularml/issue/MKT-176/add-redirect"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                "teamx/MKT-176-add-redirect",
+                str(tmp_path / "MKT-176-add-redirect"),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+
+class TestLinearUrlAutoDetect:
+    """Tests for pasted Linear URLs behaving like -l."""
+
+    def test_pasted_url_names_branch_from_issue(self, tmp_path: Path) -> None:
+        """A Linear issue URL as the positional argument implies -l."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "https://linear.app/modularml/issue/MKT-176/add-redirect"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            [
+                "worktree",
+                "add",
+                "-b",
+                "MKT-176-add-redirect",
+                str(tmp_path / "MKT-176-add-redirect"),
+                "origin/main",
+            ],
+            cwd=str(bare_dir),
+        )
+
+    def test_plain_names_are_not_urls(self) -> None:
+        """Ordinary branch names must never trip the URL detection."""
+        from gh_wt import is_linear_issue_url
+
+        assert not is_linear_issue_url("feature-branch")
+        assert not is_linear_issue_url("billw/issue/foo")
+        assert is_linear_issue_url("https://linear.app/modularml/issue/MKT-176/add-redirect")
+
+
+class TestSetupScriptResolution:
+    """Tests for hook resolution with and without the setup-script key."""
+
+    def run_add(self, tmp_path: Path):
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})):
+                    with patch("gh_wt.subprocess.run") as mock_subprocess_run:
+                        result = run_cli(["add", "feature-branch"])
+        return result, mock_subprocess_run
+
+    def test_configured_script_runs_from_repo_root(self, tmp_path: Path, monkeypatch) -> None:
+        """A setup-script key resolves relative to the repo root."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / "worktree-config.toml").write_text('setup-script = "worktree-setup.sh"\n')
+        script = tmp_path / "worktree-setup.sh"
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        nested = tmp_path / "elsewhere"
+        nested.mkdir()
+        monkeypatch.chdir(nested)
+
+        result, mock_subprocess_run = self.run_add(tmp_path)
+
+        assert result.exit_code == 0
+        mock_subprocess_run.assert_called_once_with(
+            [str(script), "feature-branch"],
+            cwd=str(tmp_path),
+            check=True,
+        )
+
+    def test_configured_script_missing_errors(self, tmp_path: Path, monkeypatch) -> None:
+        """A configured script that cannot run is a loud failure."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / "worktree-config.toml").write_text('setup-script = "worktree-setup.sh"\n')
+        monkeypatch.chdir(tmp_path)
+
+        result, mock_subprocess_run = self.run_add(tmp_path)
+
+        assert result.exit_code == 1
+        assert "Error: setup-script 'worktree-setup.sh' not found or not executable" in result.output
+        mock_subprocess_run.assert_not_called()
+
+    def test_both_default_scripts_error_without_config(self, tmp_path: Path, monkeypatch) -> None:
+        """Finding both default script names is ambiguous and must fail."""
+        (tmp_path / ".bare").mkdir()
+        for name in ("worktree-setup.sh", "setup-worktree.sh"):
+            script = tmp_path / name
+            script.write_text("#!/bin/sh\n")
+            script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        result, mock_subprocess_run = self.run_add(tmp_path)
+
+        assert result.exit_code == 1
+        assert "Error: Found both worktree-setup.sh and setup-worktree.sh." in result.output
+        mock_subprocess_run.assert_not_called()
+
+    def test_new_default_script_name_runs(self, tmp_path: Path, monkeypatch) -> None:
+        """worktree-setup.sh is found without any config."""
+        (tmp_path / ".bare").mkdir()
+        script = tmp_path / "worktree-setup.sh"
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+
+        result, mock_subprocess_run = self.run_add(tmp_path)
+
+        assert result.exit_code == 0
+        mock_subprocess_run.assert_called_once_with(
+            [str(script), "feature-branch"],
+            cwd=str(tmp_path),
+            check=True,
+        )
+
+    def test_hint_printed_for_old_script_without_config(self, tmp_path: Path, monkeypatch) -> None:
+        """The migration hint appears when only the old script name exists."""
+        (tmp_path / ".bare").mkdir()
+        script = tmp_path / "setup-worktree.sh"
+        script.write_text("#!/bin/sh\n")
+        monkeypatch.chdir(tmp_path)
+
+        result, _ = self.run_add(tmp_path)
+
+        assert result.exit_code == 0
+        assert "Hint: found setup-worktree.sh. Run 'gh wt init' to create worktree-config.toml and migrate." in result.output
+
+
+class TestInitCommand:
+    """Tests for gh wt init: migration and conversion."""
+
+    def test_init_scaffolds_config_and_script_in_bare_layout(self, tmp_path: Path, monkeypatch) -> None:
+        """init on a bare-layout repo without scripts scaffolds both files."""
+        (tmp_path / ".bare").mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert (tmp_path / "worktree-setup.sh").is_file()
+        config_text = (tmp_path / "worktree-config.toml").read_text()
+        assert 'setup-script = "worktree-setup.sh"' in config_text
+        assert '# branch-prefix = "billw"' in config_text
+
+    def test_init_renames_old_script_when_confirmed(self, tmp_path: Path, monkeypatch) -> None:
+        """Accepting the prompt renames setup-worktree.sh and points the config at it."""
+        (tmp_path / ".bare").mkdir()
+        old_script = tmp_path / "setup-worktree.sh"
+        old_script.write_text("#!/bin/sh\ncustom\n")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            with patch("builtins.input", return_value="y"):
+                result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert not old_script.exists()
+        assert (tmp_path / "worktree-setup.sh").read_text() == "#!/bin/sh\ncustom\n"
+        assert 'setup-script = "worktree-setup.sh"' in (tmp_path / "worktree-config.toml").read_text()
+
+    def test_init_keeps_old_script_when_declined(self, tmp_path: Path, monkeypatch) -> None:
+        """Declining the prompt keeps the old name and records it in the config."""
+        (tmp_path / ".bare").mkdir()
+        old_script = tmp_path / "setup-worktree.sh"
+        old_script.write_text("#!/bin/sh\n")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            with patch("builtins.input", return_value="n"):
+                result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert old_script.exists()
+        assert 'setup-script = "setup-worktree.sh"' in (tmp_path / "worktree-config.toml").read_text()
+
+    def test_init_reports_nothing_to_do(self, tmp_path: Path, monkeypatch) -> None:
+        """init is a no-op when the config already exists."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / "worktree-config.toml").write_text('branch-prefix = "billw"\n')
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert "Nothing to do: worktree-config.toml already exists." in result.output
+
+    def test_init_errors_outside_git(self, tmp_path: Path, monkeypatch) -> None:
+        """init outside any git repository fails."""
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.get_repo_root", return_value=None):
+            with patch("gh_wt.run_git", return_value=""):
+                result = run_cli(["init"])
+
+        assert result.exit_code == 1
+        assert "Error: Not a git repository" in result.output
+
+
+def make_normal_clone(repo_root: Path) -> None:
+    """Create a real single-commit git repo for conversion tests."""
+    subprocess.run(["git", "init", "-b", "main", str(repo_root)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo_root), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo_root), "config", "user.name", "Test"], check=True)
+    (repo_root / "file.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(repo_root), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo_root), "commit", "-m", "initial"], check=True, capture_output=True)
+
+
+class TestInitConversion:
+    """Real-git tests for converting a normal clone to the bare layout."""
+
+    def test_converts_clean_clone_in_place(self, tmp_path: Path, monkeypatch) -> None:
+        """A clean normal clone becomes .bare/ plus a branch worktree."""
+        repo_root = tmp_path / "myrepo"
+        make_normal_clone(repo_root)
+        monkeypatch.chdir(repo_root)
+
+        with patch("builtins.input", return_value="y"):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert "Converted to bare worktree layout." in result.output
+        assert (repo_root / ".bare").is_dir()
+        assert not (repo_root / ".git").exists()
+        assert (repo_root / "main" / "file.txt").read_text() == "hello\n"
+        assert (repo_root / "worktree-setup.sh").is_file()
+        assert 'setup-script = "worktree-setup.sh"' in (repo_root / "worktree-config.toml").read_text()
+
+    def test_conversion_aborts_on_dirty_tree(self, tmp_path: Path, monkeypatch) -> None:
+        """Untracked files block conversion; the clone is left untouched."""
+        repo_root = tmp_path / "myrepo"
+        make_normal_clone(repo_root)
+        (repo_root / "untracked.txt").write_text("wip\n")
+        monkeypatch.chdir(repo_root)
+
+        result = run_cli(["init"])
+
+        assert result.exit_code == 1
+        assert "Error: Working tree has uncommitted or untracked files." in result.output
+        assert (repo_root / ".git").is_dir()
+        assert not (repo_root / ".bare").exists()
+
+    def test_conversion_declined_leaves_clone_untouched(self, tmp_path: Path, monkeypatch) -> None:
+        """Declining the confirm prompt changes nothing."""
+        repo_root = tmp_path / "myrepo"
+        make_normal_clone(repo_root)
+        monkeypatch.chdir(repo_root)
+
+        with patch("builtins.input", return_value="n"):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert (repo_root / ".git").is_dir()
+        assert not (repo_root / ".bare").exists()

@@ -37,10 +37,28 @@ Clone a repository into the `.bare/` layout and create the default branch worktr
 gh wt clone owner/repo
 ```
 
-`clone` also writes an executable starter `setup-worktree.sh` into the new repo
-root. By default it drops you into each newly created worktree by `cd`'ing into
-it and starting an interactive shell. Edit it to add project-specific setup, or
-delete it if you do not want the hook to run.
+`clone` also writes an executable starter `worktree-setup.sh` and a
+`worktree-config.toml` into the new repo root, and configures the remote
+fetch refspec so `git fetch` keeps `origin/*` remote-tracking refs up to
+date. The starter setup script validates the new worktree folder and leaves
+a commented slot for project-specific setup (copying `.env` files, installing
+dependencies, and so on). Edit it to taste, or delete it if you do not want
+the hook to run.
+
+Set up an existing repo — either a bare-git layout that predates the config
+file, or a plain clone you want converted to the worktree layout:
+
+```bash
+gh wt init
+```
+
+In a bare-layout repo, `init` fixes the fetch refspec if it is missing and
+scaffolds `worktree-config.toml`. If it finds the legacy `setup-worktree.sh`,
+it offers to rename it to `worktree-setup.sh`; either way the config records
+the name in use. In a normal clone, `init` offers to convert it in place:
+`.git/` becomes `.bare/`, the checked-out branch moves into its own worktree
+folder, and local branches, stashes, and reflog all survive. Conversion
+requires a fully clean tree (no modified, staged, or untracked files).
 
 Add a worktree for a branch:
 
@@ -97,11 +115,46 @@ A URL without a title slug yields just the issue ID; query strings, fragments,
 and trailing slashes are ignored. `--linear` cannot be combined with
 `--branch-name`, since both control the branch name.
 
-After a worktree is created, `gh wt add` looks in the current directory for an
-executable `setup-worktree.sh` and runs it with the new worktree folder name:
+Pasting a Linear issue URL as the positional argument works without the flag —
+it is detected automatically and behaves exactly like `-l`:
 
 ```bash
-./setup-worktree.sh feature-branch
+gh wt add https://linear.app/modularml/issue/MKT-176/add-redirect-for-mojo-package-submission-page
+```
+
+## Configuration
+
+Each repo can have a `worktree-config.toml` in the repo root (next to the
+setup script). Both keys are optional:
+
+```toml
+setup-script = "worktree-setup.sh"
+branch-prefix = "billw"
+```
+
+`branch-prefix` prepends `<prefix>/` to bare branch names. `gh wt add foo`
+first checks out `origin/billw/foo` if it exists, then `origin/foo`, and
+otherwise creates a new `billw/foo` branch. The prefix never applies when the
+name already contains a `/` (full branch names, including other people's
+branches), when `--branch-name` is given (exact names stay exact), or when a
+positional prefix is used with `--linear` (it wins over the config). Linear-
+derived branch names do get the prefix.
+
+`setup-script` names the setup hook, resolved relative to the repo root. When
+set, the script must exist and be executable — a missing configured script is
+an error, not a silent skip.
+
+Without the key, `gh wt add` looks in the current directory for an executable
+`worktree-setup.sh`, then the legacy `setup-worktree.sh`. Finding both is an
+error, since the choice is ambiguous — set `setup-script` to pick one. Repos
+still using the legacy name without a config get a one-line hint pointing at
+`gh wt init`.
+
+The hook runs after the worktree is created, with the new folder name as its
+argument:
+
+```bash
+./worktree-setup.sh feature-branch
 ```
 
 If the setup script exits non-zero, `gh wt add` exits non-zero too. The created
@@ -162,8 +215,8 @@ gh wt status
 
 - GitHub CLI (`gh`)
 - Git
-- Python 3.10+
-- Bare-git layout created by `gh wt clone`, or an existing repo with `.bare/`
+- Python 3.10+ (3.11+ when a `worktree-config.toml` is present, for `tomllib`)
+- Bare-git layout created by `gh wt clone` or `gh wt init`, or an existing repo with `.bare/`
 
 ## Development
 
