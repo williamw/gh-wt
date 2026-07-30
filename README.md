@@ -53,9 +53,10 @@ gh wt init
 ```
 
 In a bare-layout repo, `init` fixes the fetch refspec if it is missing and
-scaffolds `worktree-config.toml`. If it finds the legacy `setup-worktree.sh`,
-it offers to rename it to `worktree-setup.sh`; either way the config records
-the name in use. In a normal clone, `init` offers to convert it in place:
+scaffolds `worktree-config.toml`, asking for an optional branch prefix
+(Enter for none). If it finds the legacy `setup-worktree.sh`, it offers to
+rename it to `worktree-setup.sh`; either way the config records the name in
+use. In a normal clone, `init` offers to convert it in place:
 `.git/` becomes `.bare/`, the checked-out branch moves into its own worktree
 folder, and local branches, stashes, and reflog all survive. Conversion
 requires a fully clean tree (no modified, staged, or untracked files).

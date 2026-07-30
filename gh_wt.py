@@ -90,10 +90,14 @@ def get_branch_prefix(config: dict) -> str:
     return (config.get("branch-prefix") or "").rstrip("/")
 
 
-def write_config_scaffold(repo_root: Path, script_name: str = NEW_SETUP_SCRIPT_NAME) -> Path:
+def write_config_scaffold(repo_root: Path, script_name: str = NEW_SETUP_SCRIPT_NAME, branch_prefix: str = "") -> Path:
     """Write the starter worktree-config.toml into the repo root."""
+    if branch_prefix:
+        prefix_line = f'branch-prefix = "{branch_prefix}"'
+    else:
+        prefix_line = '# branch-prefix = "billw"'
     config_path = repo_root / CONFIG_FILE_NAME
-    config_path.write_text(f'setup-script = "{script_name}"\n# branch-prefix = "billw"\n')
+    config_path.write_text(f'setup-script = "{script_name}"\n{prefix_line}\n')
     return config_path
 
 
@@ -387,6 +391,11 @@ def cmd_clone(args):
     print(f"Created {config_path}")
 
 
+def prompt_branch_prefix() -> str:
+    """Ask for a branch prefix to scaffold into the config; Enter means none."""
+    return input("Branch prefix (e.g. billw/), Enter for none: ").strip().rstrip("/")
+
+
 def confirm(prompt: str, default: bool = False) -> bool:
     """Ask a yes/no question on stdin; Enter picks the default."""
     reply = input(prompt).strip().lower()
@@ -419,7 +428,7 @@ def init_bare_layout(repo_root: Path) -> None:
         script_path = write_setup_worktree_script(repo_root)
         print(f"Created {script_path}")
 
-    config_path = write_config_scaffold(repo_root, script_name)
+    config_path = write_config_scaffold(repo_root, script_name, prompt_branch_prefix())
     print(f"Created {config_path}")
 
 
@@ -472,7 +481,7 @@ def convert_normal_clone(repo_root: Path) -> None:
     script_path = write_setup_worktree_script(repo_root)
     print(f"Created {script_path}")
 
-    config_path = write_config_scaffold(repo_root)
+    config_path = write_config_scaffold(repo_root, branch_prefix=prompt_branch_prefix())
     print(f"Created {config_path}")
 
 

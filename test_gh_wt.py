@@ -1843,6 +1843,23 @@ class TestBranchPrefix:
             cwd=str(tmp_path / "foo"),
         )
 
+    def test_config_prefix_with_trailing_slash_is_normalized(self, tmp_path: Path) -> None:
+        """A branch-prefix written with a trailing slash behaves like one without."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        (tmp_path / "worktree-config.toml").write_text('branch-prefix = "billw/"\n')
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", side_effect=make_remote_listing_run_git({})) as mock_run_git:
+                    result = run_cli(["add", "foo"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "billw/foo", str(tmp_path / "foo"), "origin/main"],
+            cwd=str(bare_dir),
+        )
+
     def test_prefers_existing_prefixed_remote_branch(self, tmp_path: Path) -> None:
         """`add foo` should check out origin/billw/foo when it exists."""
         bare_dir = tmp_path / ".bare"
@@ -2095,13 +2112,26 @@ class TestInitCommand:
         monkeypatch.chdir(tmp_path)
 
         with patch("gh_wt.run_git", return_value=""):
-            result = run_cli(["init"])
+            with patch("builtins.input", return_value=""):
+                result = run_cli(["init"])
 
         assert result.exit_code == 0
         assert (tmp_path / "worktree-setup.sh").is_file()
         config_text = (tmp_path / "worktree-config.toml").read_text()
         assert 'setup-script = "worktree-setup.sh"' in config_text
         assert '# branch-prefix = "billw"' in config_text
+
+    def test_init_writes_entered_branch_prefix(self, tmp_path: Path, monkeypatch) -> None:
+        """An entered prefix lands in the config uncommented, trailing slash stripped."""
+        (tmp_path / ".bare").mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            with patch("builtins.input", return_value="billw/"):
+                result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert 'branch-prefix = "billw"' in (tmp_path / "worktree-config.toml").read_text()
 
     def test_init_renames_old_script_when_confirmed(self, tmp_path: Path, monkeypatch) -> None:
         """Accepting the prompt renames setup-worktree.sh and points the config at it."""
@@ -2111,7 +2141,7 @@ class TestInitCommand:
         monkeypatch.chdir(tmp_path)
 
         with patch("gh_wt.run_git", return_value=""):
-            with patch("builtins.input", return_value="y"):
+            with patch("builtins.input", side_effect=["y", ""]):
                 result = run_cli(["init"])
 
         assert result.exit_code == 0
@@ -2144,7 +2174,7 @@ class TestInitCommand:
         monkeypatch.chdir(tmp_path)
 
         with patch("gh_wt.run_git", return_value=""):
-            with patch("builtins.input", return_value="n"):
+            with patch("builtins.input", side_effect=["n", ""]):
                 result = run_cli(["init"])
 
         assert result.exit_code == 0
@@ -2195,7 +2225,7 @@ class TestInitConversion:
         make_normal_clone(repo_root)
         monkeypatch.chdir(repo_root)
 
-        with patch("builtins.input", return_value="y"):
+        with patch("builtins.input", side_effect=["y", ""]):
             result = run_cli(["init"])
 
         assert result.exit_code == 0
