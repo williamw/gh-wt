@@ -2115,8 +2115,25 @@ class TestInitCommand:
                 result = run_cli(["init"])
 
         assert result.exit_code == 0
+        assert "Renamed setup-worktree.sh to worktree-setup.sh." in result.output
         assert not old_script.exists()
         assert (tmp_path / "worktree-setup.sh").read_text() == "#!/bin/sh\ncustom\n"
+        assert 'setup-script = "worktree-setup.sh"' in (tmp_path / "worktree-config.toml").read_text()
+
+    def test_init_rename_defaults_to_yes_on_enter(self, tmp_path: Path, monkeypatch) -> None:
+        """Pressing Enter at the rename prompt renames — migration is init's purpose."""
+        (tmp_path / ".bare").mkdir()
+        old_script = tmp_path / "setup-worktree.sh"
+        old_script.write_text("#!/bin/sh\n")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            with patch("builtins.input", return_value=""):
+                result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert not old_script.exists()
+        assert (tmp_path / "worktree-setup.sh").is_file()
         assert 'setup-script = "worktree-setup.sh"' in (tmp_path / "worktree-config.toml").read_text()
 
     def test_init_keeps_old_script_when_declined(self, tmp_path: Path, monkeypatch) -> None:
@@ -2131,6 +2148,7 @@ class TestInitCommand:
                 result = run_cli(["init"])
 
         assert result.exit_code == 0
+        assert "Keeping setup-worktree.sh." in result.output
         assert old_script.exists()
         assert 'setup-script = "setup-worktree.sh"' in (tmp_path / "worktree-config.toml").read_text()
 

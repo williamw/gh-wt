@@ -387,9 +387,12 @@ def cmd_clone(args):
     print(f"Created {config_path}")
 
 
-def confirm(prompt: str) -> bool:
-    """Ask a y/N question on stdin; default is no."""
-    return input(prompt).strip().lower() in ("y", "yes")
+def confirm(prompt: str, default: bool = False) -> bool:
+    """Ask a yes/no question on stdin; Enter picks the default."""
+    reply = input(prompt).strip().lower()
+    if not reply:
+        return default
+    return reply in ("y", "yes")
 
 
 def init_bare_layout(repo_root: Path) -> None:
@@ -406,10 +409,12 @@ def init_bare_layout(repo_root: Path) -> None:
     old_script = repo_root / OLD_SETUP_SCRIPT_NAME
     script_name = NEW_SETUP_SCRIPT_NAME
     if old_script.is_file():
-        if confirm(f"Rename {OLD_SETUP_SCRIPT_NAME} to {NEW_SETUP_SCRIPT_NAME}? [y/N] "):
+        if confirm(f"Rename {OLD_SETUP_SCRIPT_NAME} to {NEW_SETUP_SCRIPT_NAME}? [Y/n] ", default=True):
             old_script.rename(repo_root / NEW_SETUP_SCRIPT_NAME)
+            print(f"Renamed {OLD_SETUP_SCRIPT_NAME} to {NEW_SETUP_SCRIPT_NAME}.")
         else:
             script_name = OLD_SETUP_SCRIPT_NAME
+            print(f"Keeping {OLD_SETUP_SCRIPT_NAME}.")
     elif not (repo_root / NEW_SETUP_SCRIPT_NAME).is_file():
         script_path = write_setup_worktree_script(repo_root)
         print(f"Created {script_path}")
