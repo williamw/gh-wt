@@ -97,6 +97,12 @@ gh wt --help
 - **Submodule-aware removal:** `remove_worktree()` retries with submodule
   deinitialization and `git worktree remove --force` only when Git reports that
   submodules block removal.
+- **Deleted current directory is handled once:** `check_current_dir()` runs in
+  `cli()` just before dispatch, so every command reports the same friendly error
+  instead of a `Path.cwd()` traceback. It reads the vanished path from `$PWD`,
+  which survives as a string, and walks up to the nearest surviving ancestor for
+  the suggested `cd`. `rm` additionally calls `hint_if_cwd_removed()` to flag the
+  stranding at its source, since `rm` is what usually causes it.
 
 ## Testing Notes
 

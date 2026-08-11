@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gh_wt import get_repo_root, get_default_branch_name, cli
+from gh_wt import get_repo_root, get_default_branch_name, cli, check_current_dir, hint_if_cwd_removed
 
 
 @dataclass
@@ -2262,3 +2262,183 @@ class TestInitConversion:
         assert result.exit_code == 0
         assert (repo_root / ".git").is_dir()
         assert not (repo_root / ".bare").exists()
+
+
+class TestCurrentDirRemoved:
+    """Tests for the guard that fires when the current directory is deleted."""
+
+    def test_absolute_pwd_names_stale_path_and_escape_route(self, tmp_path: Path, monkeypatch) -> None:
+        """The message names the vanished path and the nearest surviving ancestor."""
+        stale = tmp_path / "gone"
+        monkeypatch.setenv("PWD", str(stale))
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli(["add", "feature-branch"])
+
+        assert result.exit_code == 1
+        assert f"Error: Current directory no longer exists: {stale}" in result.output
+        assert f"  Run 'cd {tmp_path}' and try again." in result.output
+        assert "Traceback" not in result.output
+
+    def test_deeply_deleted_chain_still_finds_a_surviving_ancestor(self, tmp_path: Path, monkeypatch) -> None:
+        """Several missing levels degrade to the closest directory still on disk."""
+        monkeypatch.setenv("PWD", str(tmp_path / "gone" / "deeper" / "deepest"))
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli(["status"])
+
+        assert result.exit_code == 1
+        assert f"  Run 'cd {tmp_path}' and try again." in result.output
+
+    def test_missing_pwd_falls_back_to_home_guidance(self, monkeypatch) -> None:
+        """Without a usable PWD the message omits the path and points home."""
+        monkeypatch.delenv("PWD", raising=False)
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli(["list"])
+
+        assert result.exit_code == 1
+        assert "Error: Current directory no longer exists." in result.output
+        assert "  Run 'cd' to return to your home directory, then try again." in result.output
+
+    def test_empty_pwd_falls_back_to_home_guidance(self, monkeypatch) -> None:
+        """An empty PWD is treated as unusable rather than as a bare path."""
+        monkeypatch.setenv("PWD", "")
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli(["list"])
+
+        assert result.exit_code == 1
+        assert "Error: Current directory no longer exists." in result.output
+        assert "  Run 'cd' to return to your home directory, then try again." in result.output
+
+    @pytest.mark.parametrize("argv", [
+        ["add", "feature-branch"],
+        ["list"],
+        ["rm", "feature-branch"],
+        ["status"],
+        ["init"],
+        ["clone", "https://github.com/owner/repo.git"],
+    ])
+    def test_every_command_fails_friendly(self, argv: list[str], tmp_path: Path, monkeypatch) -> None:
+        """No subcommand may leak a traceback when the current directory is gone."""
+        monkeypatch.setenv("PWD", str(tmp_path / "gone"))
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli(argv)
+
+        assert result.exit_code == 1
+        assert "Error: Current directory no longer exists:" in result.output
+        assert "Traceback" not in result.output
+
+    def test_no_arguments_still_prints_help(self, monkeypatch) -> None:
+        """Help needs no working directory, so it must survive a deleted one."""
+        monkeypatch.setenv("PWD", "/definitely/gone")
+
+        with patch("gh_wt.Path.cwd", side_effect=FileNotFoundError):
+            result = run_cli([])
+
+        assert result.exit_code == 0
+        assert "usage:" in result.output.lower()
+        assert "Current directory no longer exists" not in result.output
+
+    def test_valid_current_directory_is_silent(self, tmp_path: Path, monkeypatch) -> None:
+        """The guard must add no output during normal operation."""
+        monkeypatch.chdir(tmp_path)
+        buf = io.StringIO()
+
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            check_current_dir()
+
+        assert buf.getvalue() == ""
+
+
+class TestRemovedFolderHint:
+    """Tests for the hint that fires when rm deletes the folder the shell is in."""
+
+    def test_hint_when_shell_is_inside_removed_folder(self, tmp_path: Path, monkeypatch) -> None:
+        """Removing the folder the shell occupies points the way out."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree = tmp_path / "feature"
+        worktree.mkdir()
+        monkeypatch.chdir(worktree)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git", return_value="feature"):
+                with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                    with patch("gh_wt.remove_worktree"):
+                        result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 0
+        assert f"Hint: your shell is inside the removed folder. Run 'cd {tmp_path.resolve()}' to continue." in result.output
+
+    def test_hint_when_shell_is_in_a_subfolder_of_removed_folder(self, tmp_path: Path, monkeypatch) -> None:
+        """Being nested deeper inside the removed worktree still strands the shell."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        nested = tmp_path / "feature" / "src" / "components"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git", return_value="feature"):
+                with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                    with patch("gh_wt.remove_worktree"):
+                        result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 0
+        assert "Hint: your shell is inside the removed folder." in result.output
+
+    def test_no_hint_when_shell_is_outside_removed_folder(self, tmp_path: Path, monkeypatch) -> None:
+        """Removing an unrelated worktree leaves the shell alone."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        (tmp_path / "feature").mkdir()
+        elsewhere = tmp_path / "main"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git", return_value="feature"):
+                with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                    with patch("gh_wt.remove_worktree"):
+                        result = run_cli(["rm", "feature"])
+
+        assert result.exit_code == 0
+        assert "Hint:" not in result.output
+
+    def test_hint_when_merged_removes_the_folder_the_shell_is_in(self, tmp_path: Path, monkeypatch) -> None:
+        """--merged sweeps several worktrees, so it must flag the stranding too."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        for name in ("feature-1", "feature-2"):
+            (tmp_path / name).mkdir()
+        monkeypatch.chdir(tmp_path / "feature-2")
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_worktree_branches") as mock_get_branches:
+                with patch("gh_wt.get_pr_info") as mock_get_pr_info:
+                    with patch("gh_wt.run_git"):
+                        with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                            with patch("gh_wt.remove_worktree"):
+                                mock_get_branches.return_value = [
+                                    ("feature-1", "feature-1", str(tmp_path / "feature-1")),
+                                    ("feature-2", "feature-2", str(tmp_path / "feature-2")),
+                                ]
+                                mock_get_pr_info.return_value = {"number": 1, "state": "MERGED", "url": "http://..."}
+
+                                result = run_cli(["rm", "-m"])
+
+        assert result.exit_code == 0
+        assert f"Hint: your shell is inside the removed folder. Run 'cd {tmp_path.resolve()}' to continue." in result.output
+
+    def test_no_hint_when_nothing_was_removed(self, tmp_path: Path, monkeypatch) -> None:
+        """An empty removal list produces no hint."""
+        monkeypatch.chdir(tmp_path)
+        buf = io.StringIO()
+
+        with contextlib.redirect_stdout(buf):
+            hint_if_cwd_removed(tmp_path, [])
+
+        assert buf.getvalue() == ""

@@ -60,6 +60,35 @@ def run_git_result(args: list[str], cwd: Optional[str] = None) -> subprocess.Com
     return subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True)
 
 
+def check_current_dir() -> None:
+    """Exit with guidance when the current directory has been removed.
+
+    Every command needs a working directory, and os.getcwd() raises once the
+    directory is unlinked - which happens when `gh wt rm` deletes the worktree
+    the shell is standing in. The shell's PWD survives as a plain string, so it
+    names the vanished path and locates the nearest directory still on disk.
+    """
+    try:
+        Path.cwd()
+        return
+    except FileNotFoundError:
+        pass
+
+    stale = os.environ.get("PWD", "")
+    escape = next((parent for parent in Path(stale).parents if parent.is_dir()), None) if stale else None
+
+    if stale:
+        print(f"Error: Current directory no longer exists: {stale}", file=sys.stderr)
+    else:
+        print("Error: Current directory no longer exists.", file=sys.stderr)
+
+    if escape:
+        print(f"  Run 'cd {escape}' and try again.", file=sys.stderr)
+    else:
+        print("  Run 'cd' to return to your home directory, then try again.", file=sys.stderr)
+    sys.exit(1)
+
+
 def load_config(repo_root: Path) -> dict:
     """Read worktree-config.toml from the repo root; empty dict when absent."""
     config_path = repo_root / CONFIG_FILE_NAME
@@ -161,6 +190,20 @@ def run_setup_worktree_hook(repo_root: Path, invocation_dir: Path, folder_name: 
         subprocess.run([str(script), folder_name], cwd=str(run_dir), check=True)
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
+
+
+def hint_if_cwd_removed(invocation_dir: Path, removed_paths: list[Path]) -> None:
+    """Nudge when the shell that ran `rm` is sitting inside a removed worktree.
+
+    Without this the next command in that shell fails on a missing directory,
+    so the cause is pointed out while it is still obvious.
+    """
+    invocation = invocation_dir.resolve()
+    for removed in removed_paths:
+        removed = removed.resolve()
+        if invocation == removed or removed in invocation.parents:
+            print(f"Hint: your shell is inside the removed folder. Run 'cd {removed.parent}' to continue.")
+            return
 
 
 def remove_worktree(worktree_path: str, bare_dir: str, force: bool = False) -> None:
@@ -653,6 +696,7 @@ def cmd_rm(args):
     delete_remote = args.delete_remote
     merged = args.merged
     force = args.force
+    invocation_dir = Path.cwd()
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
@@ -671,7 +715,7 @@ def cmd_rm(args):
     if merged:
         # Remove all worktrees with merged or closed PRs
         worktrees = get_worktree_branches(repo_root)
-        removed_count = 0
+        removed_paths = []
         skipped_branches = []
 
         for folder_name, branch, worktree_path in worktrees:
@@ -698,7 +742,9 @@ def cmd_rm(args):
                     delete_remote_branch(branch, bare_dir)
 
                 print(f"Removed {folder_name}")
-                removed_count += 1
+                removed_paths.append(Path(worktree_path))
+
+        hint_if_cwd_removed(invocation_dir, removed_paths)
 
         if skipped_branches:
             print(
@@ -708,10 +754,10 @@ def cmd_rm(args):
             )
             sys.exit(1)
 
-        if removed_count == 0:
+        if not removed_paths:
             print("No merged or closed worktrees to remove")
         else:
-            print(f"Removed {removed_count} merged or closed worktree(s)")
+            print(f"Removed {len(removed_paths)} merged or closed worktree(s)")
     else:
         worktree_path = repo_root / folder
 
@@ -734,6 +780,7 @@ def cmd_rm(args):
             print(f"Removing {folder} (detached)...")
             remove_worktree(str(worktree_path), str(bare_dir), force)
             print(f"Removed {folder}")
+            hint_if_cwd_removed(invocation_dir, [worktree_path])
             return
 
         # Check safety BEFORE removing anything
@@ -756,6 +803,7 @@ def cmd_rm(args):
             delete_remote_branch(branch, bare_dir)
 
         print(f"Removed {folder}")
+        hint_if_cwd_removed(invocation_dir, [worktree_path])
 
 
 def get_pr_info(branch: str) -> Optional[dict]:
@@ -1051,6 +1099,8 @@ def cli(argv: list[str] | None = None):
     if args.command is None:
         parser.print_help()
         sys.exit(0)
+
+    check_current_dir()
 
     dispatch = {
         "clone": cmd_clone,
