@@ -797,6 +797,39 @@ class TestRemoveMergedFlag:
         mock_run_git.assert_any_call(["branch", "-D", "feature-1"], cwd=str(bare_dir))
         mock_run_git.assert_any_call(["branch", "-D", "feature-2"], cwd=str(bare_dir))
 
+    def test_remove_merged_continues_past_a_failed_removal(self, tmp_path: Path) -> None:
+        """One worktree that will not delete should not strand the ones behind it."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        (tmp_path / "feature-1").mkdir()
+        (tmp_path / "feature-2").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_worktree_branches") as mock_get_branches:
+                with patch("gh_wt.get_pr_info") as mock_get_pr_info:
+                    with patch("gh_wt.run_git") as mock_run_git:
+                        with patch("gh_wt.remove_worktree") as mock_remove_worktree:
+                            mock_get_branches.return_value = [
+                                ("feature-1", "feature-1", str(tmp_path / "feature-1")),
+                                ("feature-2", "feature-2", str(tmp_path / "feature-2")),
+                            ]
+                            mock_get_pr_info.return_value = {"number": 1, "state": "MERGED", "url": "http://..."}
+                            mock_remove_worktree.side_effect = [False, True]
+
+                            result = run_cli(["rm", "-m"])
+
+        assert result.exit_code == 1
+        assert mock_remove_worktree.call_count == 2
+        assert "feature-1" in result.output
+        assert "Removed 1 merged or closed worktree(s)" in result.output
+        # The failed worktree keeps its branch; the one behind it still loses its own.
+        branch_deletes = [
+            call.args[0] for call in mock_run_git.call_args_list
+            if call.args and call.args[0][:2] == ["branch", "-D"]
+        ]
+        assert branch_deletes == [["branch", "-D", "feature-2"]]
+
     def test_remove_merged_deletes_local_branch_by_default(self, tmp_path: Path) -> None:
         """--merged should delete local branch by default (no flag needed)."""
         bare_dir = tmp_path / ".bare"
@@ -1410,90 +1443,124 @@ class TestRemovePreflightChecks:
         )
 
 
-class TestRemoveWorktreePath:
-    """Tests for remove_worktree_path helper function."""
+class TestRemoveWorktree:
+    """Tests for the remove_worktree helper function."""
 
-    @patch("subprocess.run")
-    def test_remove_worktree_path_success(self, mock_sub_run, tmp_path: Path) -> None:
-        """Should invoke git worktree remove successfully and not trigger fallback."""
-        from gh_wt import remove_worktree_path
+    def test_success_reports_removal(self, tmp_path: Path) -> None:
+        """A clean git removal returns True and skips the fallback."""
+        from gh_wt import remove_worktree
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
         worktree_path = tmp_path / "feature"
-        worktree_path.mkdir()
 
-        # Mock success
-        mock_sub_run.return_value = MagicMock(returncode=0)
+        with patch("gh_wt.run_git_result") as mock_run_git_result:
+            mock_run_git_result.return_value = subprocess.CompletedProcess([], returncode=0)
 
-        remove_worktree_path(worktree_path, bare_dir, False)
+            assert remove_worktree(str(worktree_path), str(bare_dir)) is True
 
-        # Should call git worktree remove without --force
-        mock_sub_run.assert_called_once_with(
-            ["git", "worktree", "remove", str(worktree_path)],
+        mock_run_git_result.assert_called_once_with(
+            ["worktree", "remove", str(worktree_path)],
             cwd=str(bare_dir),
-            capture_output=True,
-            text=True
         )
 
-    @patch("subprocess.run")
-    def test_remove_worktree_path_success_with_force(self, mock_sub_run, tmp_path: Path) -> None:
-        """Should invoke git worktree remove --force successfully when force is True."""
-        from gh_wt import remove_worktree_path
+    def test_force_is_passed_through(self, tmp_path: Path) -> None:
+        """force adds --force to the git invocation."""
+        from gh_wt import remove_worktree
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
         worktree_path = tmp_path / "feature"
-        worktree_path.mkdir()
 
-        # Mock success
-        mock_sub_run.return_value = MagicMock(returncode=0)
+        with patch("gh_wt.run_git_result") as mock_run_git_result:
+            mock_run_git_result.return_value = subprocess.CompletedProcess([], returncode=0)
 
-        remove_worktree_path(worktree_path, bare_dir, True)
+            assert remove_worktree(str(worktree_path), str(bare_dir), True) is True
 
-        # Should call git worktree remove with --force
-        mock_sub_run.assert_called_once_with(
-            ["git", "worktree", "remove", str(worktree_path), "--force"],
+        mock_run_git_result.assert_called_once_with(
+            ["worktree", "remove", "--force", str(worktree_path)],
             cwd=str(bare_dir),
-            capture_output=True,
-            text=True
         )
 
-    @patch("subprocess.run")
-    @patch("gh_wt.run_git")
-    @patch("shutil.rmtree")
-    def test_remove_worktree_path_fallback_to_shutil(self, mock_rmtree, mock_run_git, mock_sub_run, tmp_path: Path) -> None:
-        """Should fallback to shutil.rmtree and git worktree prune if git worktree remove fails but directory still exists."""
-        from gh_wt import remove_worktree_path
+    def test_leftover_folder_is_cleaned_up_and_pruned(self, tmp_path: Path) -> None:
+        """A folder Git could not rmdir - the .DS_Store case - is deleted here instead."""
+        from gh_wt import remove_worktree
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
         worktree_path = tmp_path / "feature"
         worktree_path.mkdir()
+        (worktree_path / ".DS_Store").write_bytes(b"finder")
 
-        # Mock failure (e.g. Directory not empty)
-        mock_sub_run.return_value = MagicMock(returncode=1, stderr="Directory not empty")
+        with patch("gh_wt.run_git") as mock_run_git:
+            with patch("gh_wt.run_git_result") as mock_run_git_result:
+                mock_run_git_result.return_value = subprocess.CompletedProcess(
+                    [],
+                    returncode=1,
+                    stderr=f"error: failed to delete '{worktree_path}': Directory not empty",
+                )
 
-        remove_worktree_path(worktree_path, bare_dir, False)
+                assert remove_worktree(str(worktree_path), str(bare_dir)) is True
 
-        # shutil.rmtree should be called
-        mock_rmtree.assert_called_once_with(worktree_path, ignore_errors=True)
-        # git worktree prune should be called to clean up metadata
+        assert not worktree_path.exists()
         mock_run_git.assert_called_once_with(["worktree", "prune"], cwd=str(bare_dir))
 
-    @patch("subprocess.run")
-    def test_remove_worktree_path_hard_failure(self, mock_sub_run, tmp_path: Path) -> None:
-        """Should raise SystemExit if git worktree remove fails and directory does NOT exist."""
-        from gh_wt import remove_worktree_path
+    def test_failure_without_leftover_folder_reports_false(self, tmp_path: Path) -> None:
+        """A git failure with nothing left on disk is a real error, not a cleanup case."""
+        from gh_wt import remove_worktree
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
         worktree_path = tmp_path / "feature"
-        # Directory does NOT exist
 
-        # Mock failure
-        mock_sub_run.return_value = MagicMock(returncode=1, stderr="Some other error")
+        with patch("gh_wt.run_git") as mock_run_git:
+            with patch("gh_wt.run_git_result") as mock_run_git_result:
+                mock_run_git_result.return_value = subprocess.CompletedProcess(
+                    [], returncode=1, stderr=f"error: failed to delete '{worktree_path}': Directory not empty",
+                )
 
-        with pytest.raises(SystemExit) as exc_info:
-            remove_worktree_path(worktree_path, bare_dir, False)
+                assert remove_worktree(str(worktree_path), str(bare_dir)) is False
 
-        assert exc_info.value.code == 1
+        mock_run_git.assert_not_called()
+
+    def test_dirty_worktree_refusal_is_left_alone(self, tmp_path: Path) -> None:
+        """Git guarding uncommitted work is not a cleanup case - the folder must survive."""
+        from gh_wt import remove_worktree
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree_path = tmp_path / "feature"
+        worktree_path.mkdir()
+        (worktree_path / "notes.txt").write_text("unsaved work")
+
+        with patch("gh_wt.run_git") as mock_run_git:
+            with patch("gh_wt.run_git_result") as mock_run_git_result:
+                mock_run_git_result.return_value = subprocess.CompletedProcess(
+                    [],
+                    returncode=1,
+                    stderr=f"fatal: '{worktree_path}' contains modified or untracked files, use --force to delete it",
+                )
+
+                assert remove_worktree(str(worktree_path), str(bare_dir)) is False
+
+        assert (worktree_path / "notes.txt").read_text() == "unsaved work"
+        mock_run_git.assert_not_called()
+
+    def test_undeletable_folder_reports_false(self, tmp_path: Path) -> None:
+        """When even the fallback cannot clear the folder, say so instead of claiming success."""
+        from gh_wt import remove_worktree
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree_path = tmp_path / "feature"
+        worktree_path.mkdir()
+
+        with patch("gh_wt.run_git"):
+            with patch("gh_wt.run_git_result") as mock_run_git_result:
+                with patch("shutil.rmtree"):
+                    mock_run_git_result.return_value = subprocess.CompletedProcess(
+                        [],
+                        returncode=1,
+                        stderr=f"error: failed to delete '{worktree_path}': Directory not empty",
+                    )
+
+                    assert remove_worktree(str(worktree_path), str(bare_dir)) is False
+
+        assert worktree_path.exists()
 
 
 class TestParseLinearIssueUrl:

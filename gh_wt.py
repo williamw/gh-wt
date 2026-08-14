@@ -1,6 +1,7 @@
 """GitHub CLI extension for bare-git worktree management."""
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import argparse
 
 
 SUBMODULE_WORKTREE_ERROR = "working trees containing submodules cannot be moved or removed"
+DELETE_FAILED_ERROR = "failed to delete"
 REMOVABLE_PR_STATES = {"MERGED", "CLOSED"}
 
 CONFIG_FILE_NAME = "worktree-config.toml"
@@ -206,30 +208,56 @@ def hint_if_cwd_removed(invocation_dir: Path, removed_paths: list[Path]) -> None
             return
 
 
-def remove_worktree(worktree_path: str, bare_dir: str, force: bool = False) -> None:
-    """Remove a worktree, deinitializing submodules if Git requires it."""
-    remove_args = ["worktree", "remove"]
+def git_worktree_remove(worktree_path: str, bare_dir: str, force: bool) -> subprocess.CompletedProcess:
+    """Run `git worktree remove` and hand back the raw result."""
+    args = ["worktree", "remove"]
     if force:
-        remove_args.append("--force")
-    remove_args.append(worktree_path)
+        args.append("--force")
+    args.append(worktree_path)
+    return run_git_result(args, cwd=bare_dir)
 
-    result = run_git_result(remove_args, cwd=bare_dir)
-    if result.returncode == 0:
-        return
 
-    if SUBMODULE_WORKTREE_ERROR in result.stderr:
+def remove_worktree(worktree_path: str, bare_dir: str, force: bool = False) -> bool:
+    """Remove a worktree, deinitializing submodules if Git requires it.
+
+    Returns True when the folder is gone. Git empties the worktree and then
+    rmdir's the folder, so a file that reappears mid-delete - macOS writing
+    .DS_Store back is the usual culprit - fails the command with "Directory not
+    empty" and leaves an empty shell behind. Git has already unlinked its own
+    metadata by that point, so clearing the leftovers is on us.
+    """
+    result = git_worktree_remove(worktree_path, bare_dir, force)
+
+    if result.returncode != 0 and SUBMODULE_WORKTREE_ERROR in result.stderr:
         print(f"Deinitializing submodules in {worktree_path}...")
         run_git(["submodule", "deinit", "-f", "--all"], cwd=worktree_path)
+        result = git_worktree_remove(worktree_path, bare_dir, force=True)
 
-        retry_result = run_git_result(["worktree", "remove", "--force", worktree_path], cwd=bare_dir)
-        if retry_result.returncode == 0:
-            return
+    if result.returncode == 0:
+        return True
 
-        print(f"Error: {retry_result.stderr}", file=sys.stderr)
-        sys.exit(1)
+    leftover = Path(worktree_path)
+    # Only clean up after a delete Git started and could not finish. Every other
+    # refusal - a dirty worktree without --force, most of all - is Git guarding
+    # work that is still there, and deleting it here would throw that away.
+    if DELETE_FAILED_ERROR not in result.stderr or not leftover.exists():
+        print(f"Error: {result.stderr.strip()}", file=sys.stderr)
+        return False
 
-    print(f"Error: {result.stderr}", file=sys.stderr)
-    sys.exit(1)
+    print(f"Warning: git worktree remove failed: {result.stderr.strip()}", file=sys.stderr)
+    print(f"Cleaning up leftover files in {leftover.name}...", file=sys.stderr)
+    # Twice: whatever raced Git into the folder can race us the first time too.
+    for _ in range(2):
+        shutil.rmtree(leftover, ignore_errors=True)
+        if not leftover.exists():
+            break
+
+    run_git(["worktree", "prune"], cwd=bare_dir)
+
+    if leftover.exists():
+        print(f"Error: could not delete {worktree_path}", file=sys.stderr)
+        return False
+    return True
 
 
 def get_repo_root() -> Optional[Path]:
@@ -632,26 +660,6 @@ def cmd_add(args):
         print(f"Hint: found {OLD_SETUP_SCRIPT_NAME}. Run 'gh wt init' to create {CONFIG_FILE_NAME} and migrate.")
 
 
-def remove_worktree_path(worktree_path: Path, bare_dir: Path, force: bool) -> None:
-    """Remove a worktree at the given path, with a python-level force fallback if needed."""
-    cmd = ["git", "worktree", "remove", str(worktree_path)]
-    if force:
-        cmd.append("--force")
-
-    res = subprocess.run(cmd, cwd=str(bare_dir), capture_output=True, text=True)
-    if res.returncode != 0:
-        if worktree_path.exists():
-            print(f"Warning: git worktree remove failed with error: {res.stderr.strip()}", file=sys.stderr)
-            print(f"Attempting manual force cleanup of remaining files in {worktree_path.name}...", file=sys.stderr)
-            import shutil
-            shutil.rmtree(worktree_path, ignore_errors=True)
-            # Run prune to clean up Git's metadata since the folder was manually deleted
-            run_git(["worktree", "prune"], cwd=str(bare_dir))
-        else:
-            print(f"Error: {res.stderr.strip()}", file=sys.stderr)
-            sys.exit(1)
-
-
 def parse_worktree_porcelain_paths(output: str) -> list[Path]:
     """Return registered worktree paths from git worktree porcelain output."""
     paths = []
@@ -717,6 +725,7 @@ def cmd_rm(args):
         worktrees = get_worktree_branches(repo_root)
         removed_paths = []
         skipped_branches = []
+        failed_folders = []
 
         for folder_name, branch, worktree_path in worktrees:
             # Skip detached or unknown branches
@@ -732,7 +741,10 @@ def cmd_rm(args):
                     continue  # Skip this worktree entirely
 
                 print(f"Removing {folder_name} ({branch})...")
-                remove_worktree(worktree_path, str(bare_dir), force)
+                if not remove_worktree(worktree_path, str(bare_dir), force):
+                    # Keep going: one stuck folder shouldn't strand the rest.
+                    failed_folders.append(folder_name)
+                    continue
 
                 # Delete local branch (safe at this point)
                 run_git(["branch", "-D", branch], cwd=str(bare_dir))
@@ -746,18 +758,27 @@ def cmd_rm(args):
 
         hint_if_cwd_removed(invocation_dir, removed_paths)
 
+        if not removed_paths:
+            print("No merged or closed worktrees to remove")
+        else:
+            print(f"Removed {len(removed_paths)} merged or closed worktree(s)")
+
         if skipped_branches:
             print(
                 f"Error: Local branch(es) have unpushed commits: {', '.join(skipped_branches)}. "
                 f"Push changes first.",
                 file=sys.stderr
             )
-            sys.exit(1)
 
-        if not removed_paths:
-            print("No merged or closed worktrees to remove")
-        else:
-            print(f"Removed {len(removed_paths)} merged or closed worktree(s)")
+        if failed_folders:
+            print(
+                f"Error: Could not remove: {', '.join(failed_folders)}. "
+                f"Their branches were left in place.",
+                file=sys.stderr
+            )
+
+        if skipped_branches or failed_folders:
+            sys.exit(1)
     else:
         worktree_path = repo_root / folder
 
@@ -778,7 +799,8 @@ def cmd_rm(args):
         )
         if not branch or branch == "HEAD":
             print(f"Removing {folder} (detached)...")
-            remove_worktree(str(worktree_path), str(bare_dir), force)
+            if not remove_worktree(str(worktree_path), str(bare_dir), force):
+                sys.exit(1)
             print(f"Removed {folder}")
             hint_if_cwd_removed(invocation_dir, [worktree_path])
             return
@@ -793,7 +815,8 @@ def cmd_rm(args):
             sys.exit(1)
 
         print(f"Removing {folder} ({branch})...")
-        remove_worktree(str(worktree_path), str(bare_dir), force)
+        if not remove_worktree(str(worktree_path), str(bare_dir), force):
+            sys.exit(1)
 
         # Delete local branch (safe at this point)
         run_git(["branch", "-D", branch], cwd=str(bare_dir))

@@ -97,6 +97,14 @@ gh wt --help
 - **Submodule-aware removal:** `remove_worktree()` retries with submodule
   deinitialization and `git worktree remove --force` only when Git reports that
   submodules block removal.
+- **Removal returns a bool and cleans up after Git:** Git empties a worktree and
+  then rmdir's the folder, so anything that reappears mid-delete (macOS
+  rewriting `.DS_Store`) fails the command with "Directory not empty" — after
+  Git has already unlinked its own metadata. `remove_worktree()` deletes the
+  leftovers itself and runs `git worktree prune`, then reports success as a
+  bool rather than exiting. `rm --merged` records failures and keeps going so
+  one stuck folder cannot strand the worktrees behind it, exiting non-zero at
+  the end and leaving the failed worktree's branch in place.
 - **Deleted current directory is handled once:** `check_current_dir()` runs in
   `cli()` just before dispatch, so every command reports the same friendly error
   instead of a `Path.cwd()` traceback. It reads the vanished path from `$PWD`,
