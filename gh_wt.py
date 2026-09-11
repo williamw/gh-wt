@@ -836,7 +836,7 @@ def get_pr_info(branch: str) -> Optional[dict]:
     """
     try:
         result = subprocess.run(
-            ["gh", "pr", "view", branch, "--json", "number,state,url"],
+            ["gh", "pr", "view", branch, "--json", "number,state,url,isDraft"],
             capture_output=True,
             text=True,
             check=False,
@@ -1062,8 +1062,11 @@ def cmd_status(args):
                         if "error" in pr_info:
                             pr_msg = f"({pr_info['error']})"
                         else:
-                            pr_msg = f"#{pr_info['number']} ({pr_info['state']}) - {pr_info['url']}"
-                            if pr_info['state'] == 'MERGED':
+                            state = pr_info['state']
+                            if state == 'OPEN' and pr_info.get('isDraft'):
+                                state = 'DRAFT'
+                            pr_msg = f"#{pr_info['number']} ({state}) - {pr_info['url']}"
+                            if state == 'MERGED':
                                 branch_deleted = True
 
                 print(f"{folder_name}")

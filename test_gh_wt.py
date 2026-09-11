@@ -210,6 +210,36 @@ class TestStatusCommand:
         assert "#45" in result.output
         assert "OPEN" in result.output
 
+    def test_status_shows_draft_when_pr_is_draft(self, tmp_path: Path) -> None:
+        """Status should show (DRAFT) instead of (OPEN) when gh reports isDraft."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        worktree_output = f"{tmp_path}/feature\t\t\t(feature)"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git") as mock_run_git:
+                with patch("subprocess.run") as mock_subprocess:
+                    mock_run_git.side_effect = [
+                        worktree_output,
+                        "feature",  # rev-parse
+                        "",  # status porcelain
+                        "0", "0",  # ahead, behind
+                    ]
+                    # Mock gh pr view response with isDraft: true
+                    mock_subprocess.return_value = MagicMock(
+                        stdout='{"number": 2271, "state": "OPEN", "url": "https://github.com/owner/repo/pull/2271", "isDraft": true}',
+                        returncode=0,
+                    )
+                    result = run_cli(["status"])
+
+        assert result.exit_code == 0
+        assert "#2271" in result.output
+        assert "(DRAFT)" in result.output
+        assert "(OPEN)" not in result.output
+        # Confirm the draft state is what reaches the line, not the raw OPEN
+        assert "PR: #2271 (DRAFT) -" in result.output
+
     def test_status_shows_no_pr_when_not_found(self, tmp_path: Path) -> None:
         """Status should indicate when no PR exists for branch."""
         bare_dir = tmp_path / ".bare"
