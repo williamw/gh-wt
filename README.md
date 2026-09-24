@@ -206,6 +206,78 @@ List worktrees:
 gh wt list
 ```
 
+## Stacked PRs
+
+`gh wt stack` turns the worktree you are standing in into the host for a
+[`gh stack`](https://gh.io/stacks) stack of pull requests. It is a converter,
+not a creator: start work normally, and convert when the change outgrows one
+review.
+
+```bash
+gh wt add MCL-133
+cd MCL-133
+# ...work grows too large for one PR...
+gh wt stack
+```
+
+Conversion adopts the current branch as the bottom layer, enables `git rerere`
+in the shared `.bare/config` (which `gh stack init` does not do, despite its
+README), and leaves the folder and branch untouched. Layers are added with
+plain `gh stack` commands:
+
+```bash
+gh stack add MCL-133-02-lago-timezone-sync
+gh stack submit
+```
+
+**A whole stack lives in one worktree.** Branches do not live "in" a worktree;
+the folder holds exactly one layer at a time, and `gh stack up`/`down`/`switch`
+swap it in place. `gh stack rebase` checks out each layer in turn, so a layer
+held by a second worktree breaks the cascade — and Git will not stop you,
+because it only refuses the branch a worktree *currently* holds. `gh wt add`
+therefore refuses any branch that is a layer of a known stack.
+
+**Layer branches cannot nest under the bottom layer.** Refs are filesystem
+paths, so if the bottom layer is `billw/MCL-133`, then `billw/MCL-133/02-foo`
+cannot exist. Use flat names such as `billw/MCL-133-02-foo`.
+
+`gh wt stack` refuses to run on the trunk worktree, on a detached HEAD, on a
+worktree that already hosts a stack, and when the `gh stack` extension is
+missing. Install it with `gh extension install github/gh-stack`.
+
+If the adopted branch is still too large for one review (more than 3 commits
+or 500 changed lines), `gh wt stack` says so. When its output is being captured
+rather than shown in a terminal — as when an AI agent runs it — it also prints
+a short block pointing at `gh wt stack --agent`, which prints the full
+layer-splitting procedure. Run `gh wt stack --agent` yourself to see exactly
+what agents are told.
+
+`gh wt status` renders a stack worktree as its layers rather than as whichever
+branch happens to be checked out:
+
+```text
+MCL-133
+  Stack: #2331 - 5 layers, on layer 2
+  Status: Clean
+  Layers:
+    1  billw/MCL-133-01-api-timezone-filters        #2326 (OPEN)
+    2  billw/MCL-133-02-lago-timezone-sync          #2327 (OPEN)   <- current
+    3  billw/MCL-133-03-dashboard-org-timezone      #2328 (OPEN)
+```
+
+A layer needing a rebase is flagged and makes `status` exit non-zero. If
+`gh stack view` is unavailable, `status` falls back to the ordinary
+single-branch display.
+
+`gh wt rm` treats a stack worktree as all-or-nothing: `gh wt rm --merged`
+removes it only when every layer's PR is merged or closed, and then deletes
+every layer branch (and with `-d`, every layer's remote branch). `gh wt rm
+<folder>` checks all layers for unpushed work before removing anything.
+
+Known limitation: `gh stack trunk` and `gh stack checkout <trunk>` cannot work
+in this layout, because trunk is already checked out in its own worktree.
+
+
 Show status for all worktrees:
 
 ```bash

@@ -1,5 +1,6 @@
 """Tests for gh-wt CLI tool."""
 
+import json
 import subprocess
 import sys
 import io
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import gh_wt
 from gh_wt import get_repo_root, get_default_branch_name, cli, check_current_dir, hint_if_cwd_removed
 
 
@@ -2539,3 +2541,549 @@ class TestRemovedFolderHint:
             hint_if_cwd_removed(tmp_path, [])
 
         assert buf.getvalue() == ""
+
+
+def fake_git(responses: dict[str, str], default: str = ""):
+    """Build a run_git side effect that dispatches on the git subcommand."""
+    def run(args, cwd=None, check=True):
+        command = " ".join(args)
+        for prefix, response in responses.items():
+            if command.startswith(prefix):
+                return response
+        return default
+    return run
+
+
+STACK_METADATA = {
+    "schemaVersion": 1,
+    "stacks": [
+        {
+            "number": 2331,
+            "trunk": {"branch": "main"},
+            "branches": [
+                {"branch": "billw/MCL-133-01-api"},
+                {"branch": "billw/MCL-133-02-lago"},
+            ],
+        }
+    ],
+}
+
+STACK_VIEW = {
+    "trunk": "main",
+    "currentBranch": "billw/MCL-133-02-lago",
+    "branches": [
+        {
+            "name": "billw/MCL-133-01-api",
+            "isMerged": False,
+            "needsRebase": False,
+            "pr": {"number": 2326, "state": "OPEN"},
+        },
+        {
+            "name": "billw/MCL-133-02-lago",
+            "isMerged": False,
+            "needsRebase": False,
+            "pr": {"number": 2327, "state": "OPEN"},
+        },
+    ],
+}
+
+
+class TestStackMetadata:
+    """Reading gh stack's per-worktree metadata off disk."""
+
+    def test_reads_metadata_through_linked_worktree_gitdir_pointer(self, tmp_path: Path) -> None:
+        """A linked worktree's .git file points at the git dir holding gh-stack."""
+        git_dir = tmp_path / ".bare" / "worktrees" / "MCL-133"
+        git_dir.mkdir(parents=True)
+        (git_dir / "gh-stack").write_text(json.dumps(STACK_METADATA))
+
+        worktree = tmp_path / "MCL-133"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {git_dir}\n")
+
+        metadata = gh_wt.read_stack_metadata(worktree)
+
+        assert metadata is not None
+        assert gh_wt.stack_layers(metadata) == [
+            "billw/MCL-133-01-api",
+            "billw/MCL-133-02-lago",
+        ]
+        assert gh_wt.stack_number(metadata) == 2331
+
+    def test_returns_none_without_stack_metadata(self, tmp_path: Path) -> None:
+        """A worktree hosting no stack reads as None, not an error."""
+        git_dir = tmp_path / ".bare" / "worktrees" / "plain"
+        git_dir.mkdir(parents=True)
+        worktree = tmp_path / "plain"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {git_dir}\n")
+
+        assert gh_wt.read_stack_metadata(worktree) is None
+
+    def test_invalid_metadata_is_treated_as_no_stack(self, tmp_path: Path) -> None:
+        """Corrupt metadata must degrade to the ordinary worktree path."""
+        git_dir = tmp_path / ".bare" / "worktrees" / "MCL-133"
+        git_dir.mkdir(parents=True)
+        (git_dir / "gh-stack").write_text("{not json")
+
+        worktree = tmp_path / "MCL-133"
+        worktree.mkdir()
+        (worktree / ".git").write_text(f"gitdir: {git_dir}\n")
+
+        assert gh_wt.read_stack_metadata(worktree) is None
+
+    def test_layers_span_every_stack_in_the_file(self) -> None:
+        """The metadata holds a list of stacks, so all of them count."""
+        metadata = {
+            "stacks": [
+                {"branches": [{"branch": "a"}]},
+                {"branches": [{"branch": "b"}, {"branch": "c"}]},
+            ]
+        }
+
+        assert gh_wt.stack_layers(metadata) == ["a", "b", "c"]
+
+
+class TestStackCommand:
+    """gh wt stack converts the current worktree into a stack host."""
+
+    def test_agent_flag_prints_the_split_guide(self) -> None:
+        """Agents get the full procedure on demand, anywhere."""
+        result = run_cli(["stack", "--agent"])
+
+        assert result.exit_code == 0
+        assert "splitting an oversized bottom layer" in result.output
+        assert "Split by file path, not by commit" in result.output
+        assert "Never create a separate worktree for" in result.output
+
+    def test_refuses_to_stack_the_trunk_branch(self, tmp_path: Path) -> None:
+        """Stacking trunk would create a nonsense main <- main stack."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git", side_effect=fake_git({
+                "rev-parse --show-toplevel": str(tmp_path / "main"),
+                "rev-parse --abbrev-ref": "main",
+                "symbolic-ref": "origin/main",
+            })):
+                result = run_cli(["stack"])
+
+        assert result.exit_code == 1
+        assert "refusing to stack the trunk branch 'main'" in result.output
+        assert "gh wt add <name>" in result.output
+
+    def test_refuses_a_detached_worktree(self, tmp_path: Path) -> None:
+        """gh stack needs a branch to adopt."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.run_git", side_effect=fake_git({
+                "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                "rev-parse --abbrev-ref": "HEAD",
+                "symbolic-ref": "origin/main",
+            })):
+                result = run_cli(["stack"])
+
+        assert result.exit_code == 1
+        assert "worktree is not on a branch" in result.output
+
+    def test_refuses_a_worktree_that_already_hosts_a_stack(self, tmp_path: Path) -> None:
+        """gh stack init is not idempotent, so report it before calling it."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.run_git", side_effect=fake_git({
+                    "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                    "rev-parse --abbrev-ref": "billw/MCL-133",
+                    "symbolic-ref": "origin/main",
+                })):
+                    result = run_cli(["stack"])
+
+        assert result.exit_code == 1
+        assert "MCL-133 already hosts a stack" in result.output
+
+    def test_reports_a_missing_gh_stack_extension(self, tmp_path: Path) -> None:
+        """The extension is a hard dependency; say how to install it."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=False):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                        "rev-parse --abbrev-ref": "billw/MCL-133",
+                        "symbolic-ref": "origin/main",
+                    })):
+                        result = run_cli(["stack"])
+
+        assert result.exit_code == 1
+        assert "gh stack is not installed" in result.output
+        assert "gh extension install github/gh-stack" in result.output
+
+    def test_adopts_current_branch_and_enables_rerere(self, tmp_path: Path) -> None:
+        """The happy path: rerere on, branch adopted, flat-naming warning shown."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree = tmp_path / "MCL-133"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "rev-parse --show-toplevel": str(worktree),
+                        "rev-parse --abbrev-ref": "billw/MCL-133",
+                        "symbolic-ref": "origin/main",
+                        "rev-list --count": "1",
+                    })) as mock_run_git:
+                        with patch("subprocess.run") as mock_subprocess:
+                            mock_subprocess.return_value = MagicMock(
+                                returncode=0, stdout="", stderr=""
+                            )
+                            result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert "Enabling rerere..." in result.output
+        assert "Adopting billw/MCL-133 as the bottom layer." in result.output
+        assert "Stack created: main <- billw/MCL-133" in result.output
+        assert "Layer branches cannot nest under billw/MCL-133." in result.output
+        assert "gh stack add <branch>" in result.output
+
+        mock_run_git.assert_any_call(
+            ["config", "rerere.enabled", "true"], cwd=str(bare_dir)
+        )
+        mock_subprocess.assert_any_call(
+            ["gh", "stack", "init", "billw/MCL-133"],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_leaves_rerere_alone_when_already_enabled(self, tmp_path: Path) -> None:
+        """Re-enabling an enabled setting should be silent."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                        "rev-parse --abbrev-ref": "billw/MCL-133",
+                        "symbolic-ref": "origin/main",
+                        "config --get rerere.enabled": "true",
+                        "rev-list --count": "1",
+                    })):
+                        with patch("subprocess.run") as mock_subprocess:
+                            mock_subprocess.return_value = MagicMock(
+                                returncode=0, stdout="", stderr=""
+                            )
+                            result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert "Enabling rerere..." not in result.output
+
+    def test_warns_and_prompts_agents_when_bottom_layer_is_oversized(self, tmp_path: Path) -> None:
+        """A captured stdout means an agent is reading, so offer the split."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.output_is_piped", return_value=True):
+                        with patch("gh_wt.run_git", side_effect=fake_git({
+                            "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                            "rev-parse --abbrev-ref": "billw/MCL-133",
+                            "symbolic-ref": "origin/main",
+                            "rev-list --count": "12",
+                            "diff --shortstat": " 76 files changed, 2582 insertions(+), 329 deletions(-)",
+                        })):
+                            with patch("subprocess.run") as mock_subprocess:
+                                mock_subprocess.return_value = MagicMock(
+                                    returncode=0, stdout="", stderr=""
+                                )
+                                result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert "Note: this branch is 12 commits / 2911 lines." in result.output
+        assert "Agents: this branch is likely too large for one review." in result.output
+        assert "gh wt stack --agent" in result.output
+
+    def test_hides_the_agent_block_from_a_human_terminal(self, tmp_path: Path) -> None:
+        """A TTY means a human is reading; the warning stays, the prompt does not."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.output_is_piped", return_value=False):
+                        with patch("gh_wt.run_git", side_effect=fake_git({
+                            "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                            "rev-parse --abbrev-ref": "billw/MCL-133",
+                            "symbolic-ref": "origin/main",
+                            "rev-list --count": "12",
+                            "diff --shortstat": " 76 files changed, 2582 insertions(+), 329 deletions(-)",
+                        })):
+                            with patch("subprocess.run") as mock_subprocess:
+                                mock_subprocess.return_value = MagicMock(
+                                    returncode=0, stdout="", stderr=""
+                                )
+                                result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert "Note: this branch is 12 commits / 2911 lines." in result.output
+        assert "Agents:" not in result.output
+
+    def test_small_branch_gets_no_size_warning(self, tmp_path: Path) -> None:
+        """Converting early is the good case and should stay quiet."""
+        (tmp_path / ".bare").mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.output_is_piped", return_value=True):
+                        with patch("gh_wt.run_git", side_effect=fake_git({
+                            "rev-parse --show-toplevel": str(tmp_path / "MCL-133"),
+                            "rev-parse --abbrev-ref": "billw/MCL-133",
+                            "symbolic-ref": "origin/main",
+                            "rev-list --count": "2",
+                            "diff --shortstat": " 3 files changed, 40 insertions(+), 5 deletions(-)",
+                        })):
+                            with patch("subprocess.run") as mock_subprocess:
+                                mock_subprocess.return_value = MagicMock(
+                                    returncode=0, stdout="", stderr=""
+                                )
+                                result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert "too large for one review" not in result.output
+        assert "Agents:" not in result.output
+
+
+class TestStackGuardrailOnAdd:
+    """gh wt add must not strand a stack layer in its own worktree."""
+
+    def test_add_refuses_a_branch_that_is_a_stack_layer(self, tmp_path: Path) -> None:
+        """Git allows this and fails later in gh stack rebase, so refuse up front."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch(
+                    "gh_wt.find_stack_worktree_for_branch",
+                    return_value=(tmp_path / "MCL-133", 1),
+                ):
+                    with patch("gh_wt.run_git", return_value=""):
+                        result = run_cli(["add", "billw/MCL-133-01-api"])
+
+        assert result.exit_code == 1
+        assert "layer 1 of the stack in MCL-133/" in result.output
+        assert "would break 'gh stack rebase'" in result.output
+        assert "cd MCL-133 && gh stack down" in result.output
+
+    def test_add_is_unaffected_when_no_stack_claims_the_branch(self, tmp_path: Path) -> None:
+        """Ordinary worktrees keep working exactly as before."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_default_branch_name", return_value="main"):
+                with patch("gh_wt.run_git", return_value="") as mock_run_git:
+                    result = run_cli(["add", "plain-feature"])
+
+        assert result.exit_code == 0
+        mock_run_git.assert_any_call(
+            ["worktree", "add", "-b", "plain-feature", str(tmp_path / "plain-feature"), "origin/main"],
+            cwd=str(bare_dir),
+        )
+
+    def test_finds_the_worktree_hosting_a_layer(self, tmp_path: Path) -> None:
+        """Layer lookup reports both the hosting worktree and the layer number."""
+        worktrees = [("MCL-133", "billw/MCL-133-02-lago", str(tmp_path / "MCL-133"))]
+
+        with patch("gh_wt.get_worktree_branches", return_value=worktrees):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                found = gh_wt.find_stack_worktree_for_branch(tmp_path, "billw/MCL-133-02-lago")
+
+        assert found == (tmp_path / "MCL-133", 2)
+
+
+class TestStackStatus:
+    """gh wt status renders a stack worktree as its layers."""
+
+    def test_status_lists_every_layer_with_pr_state(self, tmp_path: Path) -> None:
+        """One worktree holding a stack should show all of its layers."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree_output = f"{tmp_path}/MCL-133\t\t\t(billw/MCL-133-02-lago)"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.get_stack_view", return_value=STACK_VIEW):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "worktree list": worktree_output,
+                        "rev-parse --abbrev-ref": "billw/MCL-133-02-lago",
+                        "status --porcelain": "",
+                    })):
+                        result = run_cli(["status"])
+
+        assert result.exit_code == 0
+        assert "Stack: #2331 - 2 layers, on layer 2" in result.output
+        assert "1  billw/MCL-133-01-api  #2326 (OPEN)" in result.output
+        assert "2  billw/MCL-133-02-lago #2327 (OPEN)   <- current" in result.output
+
+    def test_status_marks_a_layer_needing_rebase_as_needing_attention(self, tmp_path: Path) -> None:
+        """A stale layer should trip the existing non-zero exit."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        stale_view = json.loads(json.dumps(STACK_VIEW))
+        stale_view["branches"][0]["needsRebase"] = True
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.get_stack_view", return_value=stale_view):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "worktree list": f"{tmp_path}/MCL-133\t\t\t(billw/MCL-133-02-lago)",
+                        "rev-parse --abbrev-ref": "billw/MCL-133-02-lago",
+                        "status --porcelain": "",
+                    })):
+                        result = run_cli(["status"])
+
+        assert result.exit_code == 1
+        assert "<- needs rebase" in result.output
+
+    def test_status_shows_layers_without_prs_before_submit(self, tmp_path: Path) -> None:
+        """Offline or pre-submit, gh stack omits the pr key entirely."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        unsubmitted = {
+            "trunk": "main",
+            "currentBranch": "billw/MCL-133-01-api",
+            "branches": [{"name": "billw/MCL-133-01-api", "isMerged": False, "needsRebase": False}],
+        }
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value={"stacks": [{"branches": []}]}):
+                with patch("gh_wt.get_stack_view", return_value=unsubmitted):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "worktree list": f"{tmp_path}/MCL-133\t\t\t(billw/MCL-133-01-api)",
+                        "rev-parse --abbrev-ref": "billw/MCL-133-01-api",
+                        "status --porcelain": "",
+                    })):
+                        result = run_cli(["status"])
+
+        assert result.exit_code == 0
+        assert "(no PR)" in result.output
+        assert "Stack: 1 layer," in result.output
+
+    def test_status_falls_back_when_the_stack_view_is_unavailable(self, tmp_path: Path) -> None:
+        """A failed gh stack view must not break status."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.get_stack_view", return_value=None):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "worktree list": f"{tmp_path}/MCL-133\t\t\t(billw/MCL-133-02-lago)",
+                        "rev-parse --abbrev-ref": "billw/MCL-133-02-lago",
+                        "status --porcelain": "",
+                        "rev-list --count": "0",
+                        "ls-remote": "abc123\trefs/heads/billw/MCL-133-02-lago",
+                    })):
+                        with patch("subprocess.run") as mock_subprocess:
+                            mock_subprocess.return_value = MagicMock(stdout="", returncode=1)
+                            result = run_cli(["status"])
+
+        assert result.exit_code == 0
+        assert "Branch: billw/MCL-133-02-lago" in result.output
+        assert "Layers:" not in result.output
+
+
+class TestStackRemoval:
+    """gh wt rm treats a stack worktree as all-or-nothing across its layers."""
+
+    def test_merged_removal_skips_a_stack_with_an_open_layer(self, tmp_path: Path) -> None:
+        """One open PR anywhere in the stack keeps the whole worktree."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktrees = [("MCL-133", "billw/MCL-133-02-lago", str(tmp_path / "MCL-133"))]
+        states = {"billw/MCL-133-01-api": "MERGED", "billw/MCL-133-02-lago": "OPEN"}
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_worktree_branches", return_value=worktrees):
+                with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                    with patch("gh_wt.get_pr_info", side_effect=lambda b: {"state": states[b]}):
+                        with patch("gh_wt.remove_worktree") as mock_remove:
+                            with patch("gh_wt.run_git", return_value=""):
+                                result = run_cli(["rm", "--merged"])
+
+        assert result.exit_code == 0
+        assert "No merged or closed worktrees to remove" in result.output
+        mock_remove.assert_not_called()
+
+    def test_merged_removal_deletes_every_layer_branch(self, tmp_path: Path) -> None:
+        """Once the whole stack has landed, no layer branch should be stranded."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktrees = [("MCL-133", "billw/MCL-133-02-lago", str(tmp_path / "MCL-133"))]
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.get_worktree_branches", return_value=worktrees):
+                with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                    with patch("gh_wt.get_pr_info", return_value={"state": "MERGED"}):
+                        with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                            with patch("gh_wt.remove_worktree", return_value=True):
+                                with patch("gh_wt.run_git", return_value="") as mock_run_git:
+                                    result = run_cli(["rm", "--merged"])
+
+        assert result.exit_code == 0
+        assert "Removing stack worktree MCL-133 (2 layers)." in result.output
+        mock_run_git.assert_any_call(
+            ["branch", "-D", "billw/MCL-133-01-api"], cwd=str(bare_dir), check=False
+        )
+        mock_run_git.assert_any_call(
+            ["branch", "-D", "billw/MCL-133-02-lago"], cwd=str(bare_dir), check=False
+        )
+
+    def test_single_removal_names_the_layer_holding_unpushed_work(self, tmp_path: Path) -> None:
+        """The blocked layer may not be the one checked out, so name it."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree = tmp_path / "MCL-133"
+        worktree.mkdir()
+        safe = {"billw/MCL-133-01-api": True, "billw/MCL-133-02-lago": False}
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.is_branch_safe_to_delete", side_effect=lambda b, _: safe[b]):
+                    with patch("gh_wt.remove_worktree") as mock_remove:
+                        with patch("gh_wt.run_git", return_value="billw/MCL-133-02-lago"):
+                            result = run_cli(["rm", "MCL-133"])
+
+        assert result.exit_code == 1
+        assert "layer 2 (billw/MCL-133-02-lago) has unpushed commits" in result.output
+        assert "Use --force to override." in result.output
+        mock_remove.assert_not_called()
+
+    def test_single_removal_deletes_all_layers_with_delete_remote(self, tmp_path: Path) -> None:
+        """-d should clear every layer from origin, not just the current one."""
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        worktree = tmp_path / "MCL-133"
+        worktree.mkdir()
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=STACK_METADATA):
+                with patch("gh_wt.is_branch_safe_to_delete", return_value=True):
+                    with patch("gh_wt.remove_worktree", return_value=True):
+                        with patch("gh_wt.delete_remote_branch") as mock_delete_remote:
+                            with patch("gh_wt.run_git", return_value="billw/MCL-133-02-lago"):
+                                result = run_cli(["rm", "MCL-133", "-d"])
+
+        assert result.exit_code == 0
+        assert "Removing stack worktree MCL-133 (2 layers)." in result.output
+        assert mock_delete_remote.call_count == 2
+        mock_delete_remote.assert_any_call("billw/MCL-133-01-api", bare_dir)
+        mock_delete_remote.assert_any_call("billw/MCL-133-02-lago", bare_dir)

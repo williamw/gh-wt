@@ -27,6 +27,7 @@ gh wt list
 gh wt status
 gh wt rm <folder> [-d|--delete-remote] [-f|--force]
 gh wt rm --merged [-d|--delete-remote] [-f|--force]
+gh wt stack [--agent]
 ```
 
 ## Development
@@ -105,6 +106,42 @@ gh wt --help
   bool rather than exiting. `rm --merged` records failures and keeps going so
   one stuck folder cannot strand the worktrees behind it, exiting non-zero at
   the end and leaving the failed worktree's branch in place.
+- **Stacks are hosted, not scattered:** `gh wt stack` only ever converts the
+  current worktree (`gh stack init <current-branch>`); it never creates one, so
+  it does not duplicate `add`'s `-B`/`-b`/`-l`/prefix/hook surface. All layers
+  of a stack live in that one folder, because `gh stack rebase` checks each
+  layer out in turn.
+- **The `add` guardrail exists because Git does not guard:** Git refuses only
+  the branch a worktree *currently* holds, so `gh wt add <sibling-layer>`
+  succeeds and fails days later mid-`gh stack rebase`.
+  `find_stack_worktree_for_branch` blocks it up front.
+- **Stack detection is filesystem-only:** `read_stack_metadata` resolves the
+  worktree's git dir from its `.git` pointer file rather than calling
+  `git rev-parse --git-dir`. gh stack stores metadata per-worktree
+  (`.bare/worktrees/<name>/gh-stack`), never in the common dir, so the folder
+  name must not be used — it goes stale as soon as the stack changes layer.
+  Avoiding the git call also keeps it off the mocked `run_git` sequences that
+  the existing tests depend on.
+- **Live PR state comes from `gh stack view --json`:** one call replaces N
+  `gh pr view` calls for a stack worktree. It exits 2 outside a stack and omits
+  the `pr` key before submit, so both are handled as normal, not as errors.
+- **Agent-facing text is frozen:** `AGENT_SPLIT_POINTER` and
+  `AGENT_SPLIT_GUIDE` are string literals with no interpolation. Formatting a
+  branch name or PR title into them would turn remote-controlled data into
+  agent instructions.
+- **`output_is_piped()` gates the agent block:** captured stdout means an agent
+  is reading. It is a named seam because `io.StringIO.isatty` cannot be patched
+  in tests.
+- **`gh wt stack` refuses trunk:** `gh stack init main` succeeds and creates a
+  nonsense `main <- main` stack. It also refuses detached HEADs, already-stacked
+  worktrees (`gh stack init` is not idempotent), and a missing extension.
+- **`rerere` is set by gh-wt:** `gh stack init` does not enable it despite its
+  README. `enable_rerere` writes to the shared `.bare/config`.
+- **Removal reads layers first:** stack metadata lives inside the worktree's
+  git dir and dies with it, so `cmd_rm` collects layers before removal. Stack
+  removal is all-or-nothing and deletes every layer branch; single-branch
+  removal keeps its exact original `run_git` call signature, which the existing
+  tests assert on.
 - **Deleted current directory is handled once:** `check_current_dir()` runs in
   `cli()` just before dispatch, so every command reports the same friendly error
   instead of a `Path.cwd()` traceback. It reads the vanished path from `$PWD`,
