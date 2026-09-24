@@ -502,7 +502,7 @@ class TestAddCommand:
                     ])
 
         assert result.exit_code == 0
-        mock_run_git.assert_any_call(["fetch", "origin"], cwd=str(bare_dir))
+        mock_run_git.assert_any_call(["fetch", "--prune", "origin"], cwd=str(bare_dir))
         mock_run_git.assert_any_call(
             ["branch", "-r", "--list", "origin/billw/FIN-361-webflow-handler"],
             cwd=str(bare_dir),
@@ -2654,7 +2654,8 @@ class TestStackCommand:
         assert result.exit_code == 0
         assert "splitting an oversized bottom layer" in result.output
         assert "Split by file path, not by commit" in result.output
-        assert "Never create a separate worktree for" in result.output
+        assert "Never\n   run 'gh stack rebase' directly" in result.output
+        assert "gh wt stack --rebase" in result.output
 
     def test_refuses_to_stack_the_trunk_branch(self, tmp_path: Path) -> None:
         """Stacking trunk would create a nonsense main <- main stack."""
@@ -2730,13 +2731,15 @@ class TestStackCommand:
         with patch("gh_wt.get_repo_root", return_value=tmp_path):
             with patch("gh_wt.read_stack_metadata", return_value=None):
                 with patch("gh_wt.is_gh_stack_installed", return_value=True):
-                    with patch("gh_wt.run_git", side_effect=fake_git({
+                    with patch("gh_wt.get_pr_info", return_value=None):
+                     with patch("gh_wt.remote_branch_exists", return_value=False):
+                      with patch("gh_wt.run_git", side_effect=fake_git({
                         "rev-parse --show-toplevel": str(worktree),
                         "rev-parse --abbrev-ref": "billw/MCL-133",
                         "symbolic-ref": "origin/main",
                         "rev-list --count": "1",
-                    })) as mock_run_git:
-                        with patch("subprocess.run") as mock_subprocess:
+                      })) as mock_run_git:
+                       with patch("subprocess.run") as mock_subprocess:
                             mock_subprocess.return_value = MagicMock(
                                 returncode=0, stdout="", stderr=""
                             )
@@ -2744,17 +2747,21 @@ class TestStackCommand:
 
         assert result.exit_code == 0
         assert "Enabling rerere..." in result.output
-        assert "Adopting billw/MCL-133 as the bottom layer." in result.output
-        assert "Stack created: main <- billw/MCL-133" in result.output
-        assert "Layer branches cannot nest under billw/MCL-133." in result.output
-        assert "gh stack add <branch>" in result.output
+        assert "Renamed billw/MCL-133 to billw/MCL-133/01" in result.output
+        assert "Moved worktree to MCL-133/01" in result.output
+        assert "Stack created: main <- billw/MCL-133/01" in result.output
+        assert "gh wt stack --add <name>" in result.output
+        assert "cd MCL-133/01" in result.output
 
         mock_run_git.assert_any_call(
             ["config", "rerere.enabled", "true"], cwd=str(bare_dir)
         )
+        mock_run_git.assert_any_call(
+            ["branch", "-m", "billw/MCL-133", "billw/MCL-133/01"], cwd=str(bare_dir)
+        )
         mock_subprocess.assert_any_call(
-            ["gh", "stack", "init", "billw/MCL-133"],
-            cwd=str(worktree),
+            ["gh", "stack", "init", "billw/MCL-133/01"],
+            cwd=str(worktree / "01"),
             capture_output=True,
             text=True,
             check=False,
@@ -2872,15 +2879,15 @@ class TestStackGuardrailOnAdd:
             with patch("gh_wt.get_default_branch_name", return_value="main"):
                 with patch(
                     "gh_wt.find_stack_worktree_for_branch",
-                    return_value=(tmp_path / "MCL-133", 1),
+                    return_value=(tmp_path / "MCL-133" / "01-api", 1),
                 ):
                     with patch("gh_wt.run_git", return_value=""):
-                        result = run_cli(["add", "billw/MCL-133-01-api"])
+                        result = run_cli(["add", "billw/MCL-133/01-api"])
 
         assert result.exit_code == 1
         assert "layer 1 of the stack in MCL-133/" in result.output
-        assert "would break 'gh stack rebase'" in result.output
-        assert "cd MCL-133 && gh stack down" in result.output
+        assert "It already has a worktree" in result.output
+        assert "cd MCL-133/01-api" in result.output
 
     def test_add_is_unaffected_when_no_stack_claims_the_branch(self, tmp_path: Path) -> None:
         """Ordinary worktrees keep working exactly as before."""
@@ -3087,3 +3094,620 @@ class TestStackRemoval:
         assert mock_delete_remote.call_count == 2
         mock_delete_remote.assert_any_call("billw/MCL-133-01-api", bare_dir)
         mock_delete_remote.assert_any_call("billw/MCL-133-02-lago", bare_dir)
+
+
+class TestLayerNaming:
+    """Layer folders and branches spell the same thing (B1 nested naming)."""
+
+    def test_unnamed_layer_is_just_its_number(self) -> None:
+        assert gh_wt.layer_folder_name(1) == "01"
+
+    def test_named_layer_carries_its_number(self) -> None:
+        assert gh_wt.layer_folder_name(2, "api") == "02-api"
+
+    def test_numbers_past_nine_keep_two_digits(self) -> None:
+        assert gh_wt.layer_folder_name(10, "ui") == "10-ui"
+
+    def test_branch_nests_the_folder_under_the_stack_root(self) -> None:
+        assert gh_wt.layer_branch_name("billw/some-feature", "02-api") == (
+            "billw/some-feature/02-api"
+        )
+
+    def test_stack_root_drops_the_layer_segment(self) -> None:
+        assert gh_wt.stack_branch_root("billw/some-feature/02-api") == "billw/some-feature"
+
+    def test_stack_root_of_an_unprefixed_branch(self) -> None:
+        assert gh_wt.stack_branch_root("some-feature/01") == "some-feature"
+
+
+# --- Integration: real git and real gh stack, network calls stubbed ----------
+
+GH_STACK_AVAILABLE = gh_wt.is_gh_stack_installed()
+
+requires_gh_stack = pytest.mark.skipif(
+    not GH_STACK_AVAILABLE, reason="gh stack extension is not installed"
+)
+
+
+def git(*args: str, cwd: Path) -> str:
+    """Run real git in cwd and return stdout."""
+    result = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+@dataclass
+class StackRepo:
+    """A real bare-layout repo with a feature worktree, ready to convert."""
+
+    root: Path
+    bare: Path
+    worktree: Path
+    branch: str
+    origin: Path
+
+    def branches(self) -> list[str]:
+        listing = git("branch", "--format=%(refname:short)", cwd=self.bare)
+        return sorted(line for line in listing.split("\n") if line)
+
+    def worktree_paths(self) -> list[str]:
+        listing = git("worktree", "list", "--porcelain", cwd=self.bare)
+        paths = (
+            line.split(" ", 1)[1]
+            for line in listing.split("\n")
+            if line.startswith("worktree ")
+        )
+        return sorted(path for path in paths if Path(path) != self.bare)
+
+
+@pytest.fixture
+def stack_repo(tmp_path: Path) -> StackRepo:
+    """Build origin + a bare-layout clone holding main/ and some-feature/."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+
+    git("init", "-q", "-b", "main", str(seed), cwd=tmp_path)
+    (seed / "f.txt").write_text("base\n")
+    git("add", "-A", cwd=seed)
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base", cwd=seed)
+    git("clone", "-q", "--bare", str(seed), str(origin), cwd=tmp_path)
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    bare = root / ".bare"
+    git("clone", "-q", "--bare", str(origin), str(bare), cwd=tmp_path)
+    git("config", "remote.origin.fetch", gh_wt.REMOTE_TRACKING_REFSPEC, cwd=bare)
+    git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", cwd=bare)
+    git("fetch", "-q", "origin", cwd=bare)
+
+    git("worktree", "add", "-q", str(root / "main"), "main", cwd=bare)
+
+    branch = "billw/some-feature"
+    git("worktree", "add", "-q", "-b", branch, str(root / "some-feature"), "main", cwd=bare)
+    git("push", "-q", "-u", "origin", branch, cwd=root / "some-feature")
+
+    (root / gh_wt.CONFIG_FILE_NAME).write_text('branch-prefix = "billw"\n')
+
+    return StackRepo(
+        root=root,
+        bare=bare,
+        worktree=root / "some-feature",
+        branch=branch,
+        origin=origin,
+    )
+
+
+@requires_gh_stack
+class TestConvertIntegration:
+    """gh wt stack converts in place against a real repo."""
+
+    def test_names_layer_one_and_moves_the_worktree(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+
+        result = run_cli(["stack", "base"])
+
+        assert result.exit_code == 0
+        assert stack_repo.worktree_paths() == sorted(
+            [
+                str(stack_repo.root / "main"),
+                str(stack_repo.root / "some-feature" / "01-base"),
+            ]
+        )
+        assert "billw/some-feature/01-base" in stack_repo.branches()
+        assert "billw/some-feature" not in stack_repo.branches()
+
+    def test_unnamed_conversion_uses_a_bare_number(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+
+        result = run_cli(["stack"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.root / "some-feature" / "01").is_dir()
+        assert "billw/some-feature/01" in stack_repo.branches()
+
+
+class TestConvertPrGate:
+    """Conversion renames layer 1, which closes a PR that branch heads."""
+
+    prompts: list[str]
+
+    def _convert(self, tmp_path: Path, pr_info, args, piped=True, reply="n"):
+        self.prompts = []
+
+        def fake_input(prompt: str = "") -> str:
+            self.prompts.append(prompt)
+            return reply
+
+        (tmp_path / ".bare").mkdir()
+        worktree = tmp_path / "MCL-133"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.get_pr_info", return_value=pr_info):
+                        with patch("gh_wt.output_is_piped", return_value=piped):
+                            with patch("gh_wt.remote_branch_exists", return_value=False):
+                                with patch("builtins.input", fake_input):
+                                    with patch("gh_wt.run_git", side_effect=fake_git({
+                                        "rev-parse --show-toplevel": str(worktree),
+                                        "rev-parse --abbrev-ref": "billw/MCL-133",
+                                        "symbolic-ref": "origin/main",
+                                        "rev-list --count": "1",
+                                    })):
+                                        with patch("subprocess.run") as sub:
+                                            sub.return_value = MagicMock(
+                                                returncode=0, stdout="", stderr=""
+                                            )
+                                            return run_cli(args)
+
+    def test_piped_run_refuses_when_a_pr_is_open(self, tmp_path: Path) -> None:
+        """An agent must never close a PR by omission."""
+        result = self._convert(tmp_path, {"number": 123, "state": "OPEN"}, ["stack"])
+
+        assert result.exit_code == 1
+        assert "has an open PR (#123); renaming it will close that PR" in result.output
+        assert "--force" in result.output
+
+    def test_force_converts_despite_an_open_pr(self, tmp_path: Path) -> None:
+        result = self._convert(
+            tmp_path, {"number": 123, "state": "OPEN"}, ["stack", "-f"]
+        )
+
+        assert result.exit_code == 0
+        assert "Renamed billw/MCL-133 to billw/MCL-133/01" in result.output
+
+    def test_terminal_run_asks_and_aborts_on_no(self, tmp_path: Path) -> None:
+        result = self._convert(
+            tmp_path, {"number": 123, "state": "OPEN"}, ["stack"], piped=False, reply="n"
+        )
+
+        assert result.exit_code == 1
+        assert self.prompts == ["Convert anyway? [y/N] "]
+        assert "Aborted." in result.output
+
+    def test_terminal_run_proceeds_on_yes(self, tmp_path: Path) -> None:
+        result = self._convert(
+            tmp_path, {"number": 123, "state": "OPEN"}, ["stack"], piped=False, reply="y"
+        )
+
+        assert result.exit_code == 0
+        assert "Renamed billw/MCL-133 to billw/MCL-133/01" in result.output
+
+    def test_a_merged_pr_does_not_gate(self, tmp_path: Path) -> None:
+        """Only an open PR can be closed by the rename."""
+        result = self._convert(tmp_path, {"number": 9, "state": "MERGED"}, ["stack"])
+
+        assert result.exit_code == 0
+
+    def test_reports_an_interrupted_move(self, tmp_path: Path) -> None:
+        """A conversion that died between moves is named, not guessed at."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / ".MCL-133.tmp").mkdir()
+        worktree = tmp_path / "MCL-133"
+
+        with patch("gh_wt.get_repo_root", return_value=tmp_path):
+            with patch("gh_wt.read_stack_metadata", return_value=None):
+                with patch("gh_wt.is_gh_stack_installed", return_value=True):
+                    with patch("gh_wt.run_git", side_effect=fake_git({
+                        "rev-parse --show-toplevel": str(worktree),
+                        "rev-parse --abbrev-ref": "billw/MCL-133",
+                        "symbolic-ref": "origin/main",
+                    })):
+                        result = run_cli(["stack"])
+
+        assert result.exit_code == 1
+        assert "a previous conversion left a worktree at .MCL-133.tmp" in result.output
+        assert "git worktree move .MCL-133.tmp MCL-133" in result.output
+
+
+@requires_gh_stack
+class TestAddLayerIntegration:
+    """gh wt stack --add grows a real stack, one layer per worktree."""
+
+    def _convert(self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        assert run_cli(["stack", "base"]).exit_code == 0
+        layer_one = stack_repo.worktree / "01-base"
+        monkeypatch.chdir(layer_one)
+        return layer_one
+
+    def test_second_layer_gets_its_own_worktree(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+
+        result = run_cli(["stack", "--add", "api"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "02-api").is_dir()
+        assert "billw/some-feature/02-api" in stack_repo.branches()
+
+    def test_host_stays_on_layer_one_after_adding(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The host must hold a branch or gh stack view stops working."""
+        layer_one = self._convert(stack_repo, monkeypatch)
+
+        run_cli(["stack", "--add", "api"])
+
+        assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=layer_one) == (
+            "billw/some-feature/01-base"
+        )
+
+    def test_third_layer_releases_and_restores_the_layer_above(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adding past layer 2 needs the top layer's branch freed and put back."""
+        self._convert(stack_repo, monkeypatch)
+        assert run_cli(["stack", "--add", "api"]).exit_code == 0
+
+        result = run_cli(["stack", "--add", "ui"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "03-ui").is_dir()
+        assert git(
+            "rev-parse", "--abbrev-ref", "HEAD", cwd=stack_repo.worktree / "02-api"
+        ) == "billw/some-feature/02-api"
+        assert git(
+            "rev-parse", "--abbrev-ref", "HEAD", cwd=stack_repo.worktree / "03-ui"
+        ) == "billw/some-feature/03-ui"
+
+    def test_uncommitted_work_in_a_layer_survives_the_dance(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An agent mid-edit in layer 2 must not lose anything when layer 3 lands."""
+        self._convert(stack_repo, monkeypatch)
+        run_cli(["stack", "--add", "api"])
+        (stack_repo.worktree / "02-api" / "f.txt").write_text("agent edit\n")
+
+        assert run_cli(["stack", "--add", "ui"]).exit_code == 0
+
+        assert (stack_repo.worktree / "02-api" / "f.txt").read_text() == "agent edit\n"
+        assert "f.txt" in git(
+            "status", "--short", cwd=stack_repo.worktree / "02-api"
+        )
+
+    def test_layers_are_numbered_from_the_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Conversion and --add share one numbering source."""
+        self._convert(stack_repo, monkeypatch)
+        run_cli(["stack", "--add", "api"])
+        run_cli(["stack", "--add", "ui"])
+
+        assert sorted(p.name for p in stack_repo.worktree.iterdir()) == [
+            "01-base", "02-api", "03-ui",
+        ]
+
+    def test_refuses_a_duplicate_layer_name(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+        run_cli(["stack", "--add", "api"])
+
+        result = run_cli(["stack", "--add", "api"])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+
+    def test_refuses_outside_a_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(stack_repo.worktree)
+
+        result = run_cli(["stack", "--add", "api"])
+
+        assert result.exit_code == 1
+        assert "not inside a stack" in result.output
+
+
+@requires_gh_stack
+class TestRenameLayerIntegration:
+    """gh wt stack --rename keeps folder, branch, and stack metadata in step."""
+
+    def _stack(self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        assert run_cli(["stack"]).exit_code == 0
+        layer_one = stack_repo.worktree / "01"
+        monkeypatch.chdir(layer_one)
+        return layer_one
+
+    def test_renames_folder_branch_and_metadata_together(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stack(stack_repo, monkeypatch)
+
+        result = run_cli(["stack", "--rename", "01", "01-base"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "01-base").is_dir()
+        assert not (stack_repo.worktree / "01").exists()
+        assert "billw/some-feature/01-base" in stack_repo.branches()
+        assert "billw/some-feature/01" not in stack_repo.branches()
+
+        metadata = gh_wt.read_stack_metadata(stack_repo.worktree / "01-base")
+        assert gh_wt.stack_layers(metadata) == ["billw/some-feature/01-base"]
+
+    def test_renames_a_layer_above_the_host(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stack(stack_repo, monkeypatch)
+        assert run_cli(["stack", "--add", "api"]).exit_code == 0
+
+        result = run_cli(["stack", "--rename", "02-api", "02-service"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "02-service").is_dir()
+        assert git(
+            "rev-parse", "--abbrev-ref", "HEAD", cwd=stack_repo.worktree / "02-service"
+        ) == "billw/some-feature/02-service"
+        metadata = gh_wt.read_stack_metadata(stack_repo.worktree / "01")
+        assert gh_wt.stack_layers(metadata)[-1] == "billw/some-feature/02-service"
+
+    def test_refuses_an_unknown_layer(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stack(stack_repo, monkeypatch)
+
+        result = run_cli(["stack", "--rename", "07", "07-nope"])
+
+        assert result.exit_code == 1
+        assert "no layer named '07'" in result.output
+
+    def test_refuses_a_name_already_taken(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stack(stack_repo, monkeypatch)
+        run_cli(["stack", "--add", "api"])
+
+        result = run_cli(["stack", "--rename", "01", "02-api"])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+
+    def test_open_pr_gates_the_rename(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same gate as conversion: a piped run must not close a PR."""
+        self._stack(stack_repo, monkeypatch)
+        monkeypatch.setattr(
+            gh_wt, "get_pr_info", lambda branch: {"number": 77, "state": "OPEN"}
+        )
+
+        result = run_cli(["stack", "--rename", "01", "01-base"])
+
+        assert result.exit_code == 1
+        assert "has an open PR (#77)" in result.output
+        assert (stack_repo.worktree / "01").is_dir()
+
+
+@requires_gh_stack
+class TestStackRemovalIntegration:
+    """Layer worktrees must never be removed, or swept, one at a time."""
+
+    def _two_layer_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        assert run_cli(["stack", "base"]).exit_code == 0
+        layer_one = stack_repo.worktree / "01-base"
+        monkeypatch.chdir(layer_one)
+        assert run_cli(["stack", "--add", "api"]).exit_code == 0
+        return layer_one
+
+    def test_removing_a_single_layer_is_refused(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+
+        result = run_cli(["rm", "02-api"])
+
+        assert result.exit_code == 1
+        assert "02-api is layer 2 of the stack in some-feature/" in result.output
+        assert "gh wt rm some-feature" in result.output
+        assert "billw/some-feature/02-api" in stack_repo.branches()
+        assert (stack_repo.worktree / "02-api").is_dir()
+
+    def test_merged_sweep_leaves_a_stack_with_an_open_layer_intact(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The regression: sweeping a stack layer by layer as each PR lands."""
+        self._two_layer_stack(stack_repo, monkeypatch)
+        monkeypatch.setattr(
+            gh_wt, "is_pr_removable", lambda branch: branch.endswith("01-base")
+        )
+        monkeypatch.setattr(gh_wt, "is_branch_safe_to_delete", lambda b, d: True)
+
+        result = run_cli(["rm", "--merged"])
+
+        assert result.exit_code == 0
+        assert "billw/some-feature/01-base" in stack_repo.branches()
+        assert "billw/some-feature/02-api" in stack_repo.branches()
+        assert (stack_repo.worktree / "01-base").is_dir()
+        assert (stack_repo.worktree / "02-api").is_dir()
+
+    def test_merged_sweep_takes_the_stack_once_every_layer_lands(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+        monkeypatch.setattr(gh_wt, "is_pr_removable", lambda branch: True)
+        monkeypatch.setattr(gh_wt, "is_branch_safe_to_delete", lambda b, d: True)
+
+        result = run_cli(["rm", "--merged"])
+
+        assert result.exit_code == 0
+        assert "Removing stack some-feature (2 layers)." in result.output
+        assert not (stack_repo.root / "some-feature").exists()
+        assert "billw/some-feature/01-base" not in stack_repo.branches()
+        assert "billw/some-feature/02-api" not in stack_repo.branches()
+
+    def test_removing_the_container_takes_the_whole_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+        monkeypatch.chdir(stack_repo.root)
+        monkeypatch.setattr(gh_wt, "is_branch_safe_to_delete", lambda b, d: True)
+
+        result = run_cli(["rm", "some-feature", "-f"])
+
+        assert result.exit_code == 0
+        assert "Removing stack some-feature (2 layers)." in result.output
+        assert not (stack_repo.root / "some-feature").exists()
+        assert "billw/some-feature/01-base" not in stack_repo.branches()
+        assert "billw/some-feature/02-api" not in stack_repo.branches()
+
+
+@requires_gh_stack
+class TestRebaseIntegration:
+    """gh stack rebase cannot run with layer worktrees held; the envelope frees them."""
+
+    def _two_layer_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        assert run_cli(["stack", "base"]).exit_code == 0
+        layer_one = stack_repo.worktree / "01-base"
+        monkeypatch.chdir(layer_one)
+        assert run_cli(["stack", "--add", "api"]).exit_code == 0
+        return layer_one
+
+    def test_bare_gh_stack_rebase_is_blocked_by_a_layer_worktree(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The wall the envelope exists to get around."""
+        layer_one = self._two_layer_stack(stack_repo, monkeypatch)
+
+        result = subprocess.run(
+            ["gh", "stack", "rebase", "--no-trunk"],
+            cwd=str(layer_one), capture_output=True, text=True, check=False,
+        )
+
+        assert result.returncode != 0
+        assert "already used by worktree" in (result.stdout + result.stderr)
+
+    def test_rebase_cascades_with_layer_worktrees_present(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        layer_one = self._two_layer_stack(stack_repo, monkeypatch)
+        (layer_one / "base.txt").write_text("layer one work\n")
+        git("add", "-A", cwd=layer_one)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base work",
+            cwd=layer_one)
+
+        result = run_cli(["stack", "--rebase"])
+
+        assert result.exit_code == 0
+        assert "Rebasing stack..." in result.output
+
+    def test_every_layer_ends_back_on_its_branch(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+
+        assert run_cli(["stack", "--rebase"]).exit_code == 0
+
+        for folder, branch in (
+            ("01-base", "billw/some-feature/01-base"),
+            ("02-api", "billw/some-feature/02-api"),
+        ):
+            path = stack_repo.worktree / folder
+            assert git("rev-parse", "--abbrev-ref", "HEAD", cwd=path) == branch
+
+    def test_uncommitted_work_survives_the_cascade(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+        (stack_repo.worktree / "02-api" / "f.txt").write_text("agent edit\n")
+
+        assert run_cli(["stack", "--rebase"]).exit_code == 0
+
+        assert (stack_repo.worktree / "02-api" / "f.txt").read_text() == "agent edit\n"
+
+    def test_refuses_outside_a_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(stack_repo.worktree)
+
+        result = run_cli(["stack", "--rebase"])
+
+        assert result.exit_code == 1
+        assert "not inside a stack" in result.output
+
+
+@requires_gh_stack
+class TestStackStatusIntegration:
+    """A stack reads as one entry, not as one entry per layer worktree."""
+
+    def _two_layer_stack(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        assert run_cli(["stack", "base"]).exit_code == 0
+        monkeypatch.chdir(stack_repo.worktree / "01-base")
+        assert run_cli(["stack", "--add", "api"]).exit_code == 0
+
+    def test_status_shows_one_entry_per_stack_with_layer_folders(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._two_layer_stack(stack_repo, monkeypatch)
+        monkeypatch.chdir(stack_repo.root)
+
+        result = run_cli(["status"])
+
+        assert "some-feature\n" in result.output
+        assert "Stack: 2 layers" in result.output
+        assert "01-base" in result.output
+        assert "02-api" in result.output
+
+    def test_layer_worktrees_are_not_listed_separately(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each layer must appear under its stack, not as a worktree of its own."""
+        self._two_layer_stack(stack_repo, monkeypatch)
+        monkeypatch.chdir(stack_repo.root)
+
+        result = run_cli(["status"])
+
+        headings = [line for line in result.output.split("\n") if line and not line[0].isspace()]
+        assert "02-api" not in headings
+        assert "01-base" not in headings
+        assert "some-feature" in headings

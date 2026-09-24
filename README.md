@@ -208,38 +208,68 @@ gh wt list
 
 ## Stacked PRs
 
-`gh wt stack` turns the worktree you are standing in into the host for a
-[`gh stack`](https://gh.io/stacks) stack of pull requests. It is a converter,
-not a creator: start work normally, and convert when the change outgrows one
-review.
+`gh wt stack` turns the worktree you are standing in into a stack of pull
+requests, with one folder per layer so several people or agents can work
+different layers at the same time. It is a converter, not a creator: start work
+normally, and convert when the change outgrows one review.
 
 ```bash
-gh wt add MCL-133
-cd MCL-133
+gh wt add some-feature
+cd some-feature
 # ...work grows too large for one PR...
-gh wt stack
+gh wt stack base
 ```
 
-Conversion adopts the current branch as the bottom layer, enables `git rerere`
-in the shared `.bare/config` (which `gh stack init` does not do, despite its
-README), and leaves the folder and branch untouched. Layers are added with
-plain `gh stack` commands:
+Conversion renames the branch to `billw/some-feature/01-base`, moves the
+worktree to `some-feature/01-base/`, and turns `some-feature/` into a plain
+container folder holding the layers. The name argument is optional: without it
+layer 1 is just `01`, and `gh wt stack --rename 01 01-base` renames it later.
+Conversion also enables `git rerere` in the shared `.bare/config`, which
+`gh stack init` does not do despite its README.
+
+Add layers, each in its own worktree:
 
 ```bash
-gh stack add MCL-133-02-lago-timezone-sync
-gh stack submit
+cd 01-base
+gh wt stack --add api      # -> some-feature/02-api, billw/some-feature/02-api
+gh wt stack --add ui       # -> some-feature/03-ui,  billw/some-feature/03-ui
 ```
 
-**A whole stack lives in one worktree.** Branches do not live "in" a worktree;
-the folder holds exactly one layer at a time, and `gh stack up`/`down`/`switch`
-swap it in place. `gh stack rebase` checks out each layer in turn, so a layer
-held by a second worktree breaks the cascade — and Git will not stop you,
-because it only refuses the branch a worktree *currently* holds. `gh wt add`
-therefore refuses any branch that is a layer of a known stack.
+```text
+some-feature/
+├── 01-base/   billw/some-feature/01-base
+├── 02-api/    billw/some-feature/02-api
+└── 03-ui/     billw/some-feature/03-ui
+```
 
-**Layer branches cannot nest under the bottom layer.** Refs are filesystem
-paths, so if the bottom layer is `billw/MCL-133`, then `billw/MCL-133/02-foo`
-cannot exist. Use flat names such as `billw/MCL-133-02-foo`.
+**Folder and branch always spell the same thing.** The branch path under the
+prefix is the folder path, which is why conversion has to rename layer 1: a ref
+cannot be both a leaf and a directory, so `billw/some-feature` existing would
+block `billw/some-feature/02-api` from ever being created.
+
+**Renaming layer 1 closes an open PR on it.** GitHub closes any pull request
+whose head branch is renamed. `gh wt stack` prompts before doing it, and a run
+whose output is captured — an agent, a script — fails instead, so `--force` is
+required to go ahead. `gh wt stack --rename` is gated the same way.
+
+**The bottom layer is the host.** It holds `gh stack`'s metadata and is the
+only layer without a separate worktree of its own, because `gh stack view`
+needs the host on a branch. `gh stack add` also only works at the top of a
+stack, so `gh wt stack --add` briefly detaches the layer worktrees above,
+climbs, adds, and puts them back. Uncommitted work in those folders is
+preserved.
+
+**Cascade with `gh wt stack --rebase`, never `gh stack rebase`.** The latter
+checks each layer out in turn and dies on any branch another worktree holds.
+`--rebase` detaches every layer worktree first and restores it afterwards:
+
+```bash
+gh wt stack --rebase
+```
+
+Every agent must be idle and committed when it runs. On a conflict the layers
+are left detached and the message points you at the host folder; resolve there
+and run `gh wt stack --rebase --continue`.
 
 `gh wt stack` refuses to run on the trunk worktree, on a detached HEAD, on a
 worktree that already hosts a stack, and when the `gh stack` extension is
@@ -252,27 +282,33 @@ a short block pointing at `gh wt stack --agent`, which prints the full
 layer-splitting procedure. Run `gh wt stack --agent` yourself to see exactly
 what agents are told.
 
-`gh wt status` renders a stack worktree as its layers rather than as whichever
-branch happens to be checked out:
+`gh wt status` renders a stack once, under its container, rather than once per
+layer worktree:
 
 ```text
-MCL-133
-  Stack: #2331 - 5 layers, on layer 2
+some-feature
+  Stack: #2331 - 3 layers
   Status: Clean
   Layers:
-    1  billw/MCL-133-01-api-timezone-filters        #2326 (OPEN)
-    2  billw/MCL-133-02-lago-timezone-sync          #2327 (OPEN)   <- current
-    3  billw/MCL-133-03-dashboard-org-timezone      #2328 (OPEN)
+    1  billw/some-feature/01-base  #2326 (OPEN)
+    2  billw/some-feature/02-api   #2327 (OPEN)
+    3  billw/some-feature/03-ui    #2328 (OPEN)
 ```
 
 A layer needing a rebase is flagged and makes `status` exit non-zero. If
 `gh stack view` is unavailable, `status` falls back to the ordinary
 single-branch display.
 
-`gh wt rm` treats a stack worktree as all-or-nothing: `gh wt rm --merged`
-removes it only when every layer's PR is merged or closed, and then deletes
-every layer branch (and with `-d`, every layer's remote branch). `gh wt rm
-<folder>` checks all layers for unpushed work before removing anything.
+`gh wt rm` treats a stack as all-or-nothing. Remove it by its container name:
+
+```bash
+gh wt rm some-feature
+```
+
+Removing a single layer is refused, because deleting one layer's branch out of
+a live stack strands the rest. `gh wt rm --merged` removes a stack only when
+every layer's PR is merged or closed, and never sweeps layers one at a time as
+their individual PRs land.
 
 Known limitation: `gh stack trunk` and `gh stack checkout <trunk>` cannot work
 in this layout, because trunk is already checked out in its own worktree.
