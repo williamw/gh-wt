@@ -2938,7 +2938,8 @@ class TestStackStatus:
         assert result.exit_code == 0
         assert "Stack: #2331 - 2 layers, on layer 2" in result.output
         assert "1  billw/MCL-133-01-api  #2326 (OPEN)" in result.output
-        assert "2  billw/MCL-133-02-lago #2327 (OPEN)   <- current" in result.output
+        assert "2  billw/MCL-133-02-lago #2327 (OPEN)" in result.output
+        assert "<- current" not in result.output
 
     def test_status_marks_a_layer_needing_rebase_as_needing_attention(self, tmp_path: Path) -> None:
         """A stale layer should trip the existing non-zero exit."""

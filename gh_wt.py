@@ -1887,14 +1887,12 @@ def print_stack_layers(folder_name: str, status_msg: str, view: dict, number: Op
         else:
             pr_msg = "(no PR)"
 
-        markers = []
-        if name == current:
-            markers.append("<- current")
+        # No "current" marker: every layer is checked out in its own worktree,
+        # so pointing at the host's branch would read as the others being away.
+        marker_msg = ""
         if layer.get("needsRebase"):
-            markers.append("<- needs rebase")
+            marker_msg = "   <- needs rebase"
             needs_attention = True
-
-        marker_msg = ("   " + "   ".join(markers)) if markers else ""
         print(f"    {index}  {name.ljust(width)} {pr_msg}{marker_msg}")
 
     return needs_attention
