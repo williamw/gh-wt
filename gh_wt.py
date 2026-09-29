@@ -1072,9 +1072,9 @@ def cmd_stack_rebase(args, repo_root: Path) -> None:
     count = len(released)
     print(f"Detaching {count} layer {'worktree' if count == 1 else 'worktrees'}...")
 
-    print("Rebasing stack...")
+    print("Rebasing stack..." if not args.no_trunk else "Rebasing stack layers (trunk skipped)...")
     result = subprocess.run(
-        ["gh", "stack", "rebase"],
+        ["gh", "stack", "rebase", *(["--no-trunk"] if args.no_trunk else [])],
         cwd=str(host), capture_output=True, text=True, check=False,
     )
 
@@ -2129,7 +2129,7 @@ STACK_USAGE = """\
 gh wt stack [NAME] [-f]
        gh wt stack add NAME [-L]
        gh wt stack rename OLD NEW [-f]
-       gh wt stack rebase [--continue]
+       gh wt stack rebase [--no-trunk | --continue]
        gh wt stack agent"""
 
 STACK_VERBS = ("add", "rename", "rebase", "agent")
@@ -2155,10 +2155,12 @@ def parse_stack_verb(verb: str, argv: list[str]) -> argparse.Namespace:
     elif verb == "rebase":
         parser.add_argument("--continue", dest="rebase_continue", action="store_true",
                             help="Finish a rebase that stopped on a conflict")
+        parser.add_argument("--no-trunk", action="store_true",
+                            help="Cascade layers onto each other without pulling trunk")
 
     args = argparse.Namespace(
         command="stack", name=None, force=False, add=None, local=False, rename=None,
-        rebase=verb == "rebase", rebase_continue=False, agent=verb == "agent",
+        rebase=verb == "rebase", rebase_continue=False, no_trunk=False, agent=verb == "agent",
     )
     return parser.parse_args(argv, namespace=args)
 
@@ -2237,6 +2239,7 @@ def cli(argv: list[str] | None = None):
     p_stack.add_argument("--rebase", action="store_true", help=argparse.SUPPRESS)
     p_stack.add_argument("--continue", dest="rebase_continue", action="store_true",
                          help=argparse.SUPPRESS)
+    p_stack.add_argument("--no-trunk", action="store_true", help=argparse.SUPPRESS)
     p_stack.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)

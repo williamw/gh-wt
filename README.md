@@ -271,7 +271,8 @@ checks each layer out in turn and dies on any branch another worktree holds.
 It detaches every layer worktree first and restores it afterwards:
 
 ```bash
-gh wt stack rebase
+gh wt stack rebase             # pull trunk and rebase every layer
+gh wt stack rebase --no-trunk  # cascade a lower-layer fix without pulling trunk
 ```
 
 Every agent must be idle and committed when it runs. On a conflict the layers

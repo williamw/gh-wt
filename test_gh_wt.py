@@ -2710,6 +2710,7 @@ class TestStackVerbs:
         (["stack", "rename", "01", "01-base", "-f"], ["stack", "--rename", "01", "01-base", "-f"]),
         (["stack", "rebase"], ["stack", "--rebase"]),
         (["stack", "rebase", "--continue"], ["stack", "--rebase", "--continue"]),
+        (["stack", "rebase", "--no-trunk"], ["stack", "--rebase", "--no-trunk"]),
         (["stack", "agent"], ["stack", "--agent"]),
     ])
     def test_verb_matches_the_old_flag(self, verb_form: list[str], flag_form: list[str]) -> None:
@@ -2731,7 +2732,7 @@ class TestStackVerbs:
         result = run_cli(["stack", "--help"])
 
         for line in ("gh wt stack add NAME", "gh wt stack rename OLD NEW",
-                     "gh wt stack rebase [--continue]", "gh wt stack agent"):
+                     "gh wt stack rebase [--no-trunk | --continue]", "gh wt stack agent"):
             assert line in result.output
         assert "--add" not in result.output
 
@@ -3841,6 +3842,44 @@ class TestRebaseIntegration:
 
         assert result.exit_code == 0
         assert "Rebasing stack..." in result.output
+
+    def _fix_layer_one_while_trunk_moves(self, stack_repo: StackRepo, layer_one: Path) -> None:
+        commit = ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm"]
+        (layer_one / "base.txt").write_text("layer one fix\n")
+        git("add", "-A", cwd=layer_one)
+        git(*commit, "layer one fix", cwd=layer_one)
+
+        main = stack_repo.root / "main"
+        (main / "trunk.txt").write_text("new on trunk\n")
+        git("add", "-A", cwd=main)
+        git(*commit, "trunk moves", cwd=main)
+        git("push", "-q", "origin", "main", cwd=main)
+
+    def test_no_trunk_cascades_the_fix_without_pulling_trunk(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        layer_one = self._two_layer_stack(stack_repo, monkeypatch)
+        self._fix_layer_one_while_trunk_moves(stack_repo, layer_one)
+        layer_one_tip = git("rev-parse", "HEAD", cwd=layer_one)
+
+        result = run_cli(["stack", "rebase", "--no-trunk"])
+
+        assert result.exit_code == 0, result.output
+        layer_two = stack_repo.worktree / "02-api"
+        assert (layer_two / "base.txt").read_text() == "layer one fix\n"
+        assert not (layer_two / "trunk.txt").exists()
+        assert git("rev-parse", "HEAD", cwd=layer_one) == layer_one_tip
+
+    def test_plain_rebase_pulls_trunk_into_every_layer(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        layer_one = self._two_layer_stack(stack_repo, monkeypatch)
+        self._fix_layer_one_while_trunk_moves(stack_repo, layer_one)
+
+        assert run_cli(["stack", "rebase"]).exit_code == 0
+
+        assert (layer_one / "trunk.txt").exists()
+        assert (stack_repo.worktree / "02-api" / "trunk.txt").exists()
 
     def test_every_layer_ends_back_on_its_branch(
         self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch

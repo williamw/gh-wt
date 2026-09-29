@@ -30,7 +30,7 @@ gh wt rm --merged [-d|--delete-remote] [-f|--force]
 gh wt stack [NAME] [-f|--force]
 gh wt stack add NAME [-L|--local]
 gh wt stack rename OLD NEW [-f|--force]
-gh wt stack rebase [--continue]
+gh wt stack rebase [--no-trunk | --continue]
 gh wt stack agent
 ```
 
