@@ -3400,6 +3400,48 @@ class TestAddLayerIntegration:
         assert (stack_repo.worktree / "02-api").is_dir()
         assert "billw/some-feature/02-api" in stack_repo.branches()
 
+    def test_setup_hook_gets_the_layer_path_under_the_repo_root(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+        (stack_repo.root / "worktree-config.toml").write_text('setup-script = "worktree-setup.sh"\n')
+        hook = stack_repo.root / "worktree-setup.sh"
+        hook.write_text(
+            '#!/usr/bin/env bash\n'
+            'script_dir=$(cd -- "$(dirname -- "$0")" && pwd)\n'
+            '[[ -d "$script_dir/$1" ]] || { echo "not a directory: $1" >&2; exit 1; }\n'
+            'echo "$1" > "$script_dir/hook-arg"\n'
+        )
+        hook.chmod(0o755)
+        monkeypatch.chdir(stack_repo.worktree)
+
+        result = run_cli(["stack", "--add", "api"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.root / "hook-arg").read_text().strip() == "some-feature/02-api"
+        assert "cd 02-api" in result.output
+
+    def test_accepts_the_layer_number_in_the_name(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+
+        result = run_cli(["stack", "--add", "02-api"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "02-api").is_dir()
+
+    def test_refuses_a_layer_number_out_of_place(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+
+        result = run_cli(["stack", "--add", "03-api"])
+
+        assert result.exit_code == 1
+        assert "layer 02" in result.output
+        assert "billw/some-feature/03-api" not in stack_repo.branches()
+
     def test_host_stays_on_layer_one_after_adding(
         self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
     ) -> None:

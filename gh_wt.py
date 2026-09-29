@@ -516,8 +516,21 @@ def stack_number(metadata: dict) -> Optional[int]:
 
 
 def layer_folder_name(position: int, name: str = "") -> str:
-    """Name a layer folder: '01' bare, '02-api' when the layer has a name."""
+    """Name a layer folder: '01' bare, '02-api' when the layer has a name.
+
+    A name may carry its own number, since --rename takes whole folder names
+    and '02-api' reads as the obvious thing to type. It must be the right one.
+    """
     number = f"{position:02d}"
+    given, _, rest = name.partition("-")
+    if rest and len(given) == 2 and given.isdigit():
+        if given != number:
+            print(
+                f"Error: '{name}' would be layer {number}; name it '{number}-{rest}' or just '{rest}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        name = rest
     return f"{number}-{name}" if name else number
 
 
@@ -928,8 +941,11 @@ def cmd_stack_add(args, repo_root: Path) -> None:
     run_git(["worktree", "add", str(layer_path), layer_branch], cwd=str(bare_dir))
     print(f"Created {layer_branch}")
 
-    run_setup_worktree_hook(repo_root, Path.cwd(), folder, load_config(repo_root))
-    print(f"Worktree created. To use it, run:\n\ncd ../{folder}")
+    # The hook takes the worktree's path under the repo root, and a layer sits
+    # one level down, inside its container.
+    hook_arg = str(layer_path.relative_to(repo_root))
+    run_setup_worktree_hook(repo_root, Path.cwd(), hook_arg, load_config(repo_root))
+    print(f"Worktree created. To use it, run:\n\ncd {os.path.relpath(layer_path)}")
 
 
 def write_stack_metadata(worktree_path: Path, metadata: dict) -> None:
