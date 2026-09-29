@@ -259,16 +259,27 @@ whose head branch is renamed. `gh wt stack` prompts before doing it, and a run
 whose output is captured — an agent, a script — fails instead, so `--force` is
 required to go ahead. `gh wt stack rename` is gated the same way.
 
-**The bottom layer is the host.** It holds `gh stack`'s metadata and is the
-only layer without a separate worktree of its own, because `gh stack view`
-needs the host on a branch. `gh stack add` also only works at the top of a
-stack, so `gh wt stack add` briefly detaches the layer worktrees above,
-climbs, adds, and puts them back. Uncommitted work in those folders is
-preserved.
+**The bottom layer is the host.** Its worktree holds `gh stack`'s metadata,
+so it has to stay on layer 1's branch: `gh stack view` fails on a detached
+HEAD. It is also the one layer gh-wt never detaches. `gh stack add` only works
+at the top of a stack, so `gh wt stack add` briefly detaches the layer
+worktrees above, climbs, adds, and puts them back. Uncommitted work in those
+folders is preserved.
+
+**Run `gh stack` commands from the bottom layer's folder.** It is the only
+worktree carrying the metadata, so `gh stack view`, `push`, `submit`, `merge`,
+and `sync` report "not part of a stack" anywhere else. The `gh wt stack`
+subcommands find the host themselves and work from any layer folder or from
+the container.
+
+**Move between layers with `cd`**, e.g. `cd ../02-api`. Never use
+`gh stack up`, `down`, `switch`, `top`, or `bottom`: they check a layer out in
+the current worktree, and every other layer is already checked out in its own.
 
 **Cascade with `gh wt stack rebase`, never `gh stack rebase`.** The latter
-checks each layer out in turn and dies on any branch another worktree holds.
-It detaches every layer worktree first and restores it afterwards:
+checks each layer out in turn and dies on any branch another worktree holds,
+then rolls the whole cascade back. `gh wt stack rebase` detaches every layer
+worktree first and restores it afterwards:
 
 ```bash
 gh wt stack rebase             # pull trunk and rebase every layer
@@ -320,6 +331,26 @@ their individual PRs land.
 
 Known limitation: `gh stack trunk` and `gh stack checkout <trunk>` cannot work
 in this layout, because trunk is already checked out in its own worktree.
+
+A stack from start to finish:
+
+```bash
+gh wt add MCL-123-feature && cd MCL-123-feature
+# ...work grows too large for one PR...
+gh wt stack docs                     # -> MCL-123-feature/01-docs/
+cd 01-docs && gh wt stack add api    # -> ../02-api/, pushed
+
+# fix something in 01-docs and commit it, then cascade it upward:
+gh wt stack rebase --no-trunk && gh stack push
+gh stack submit --auto --open        # open every layer's PR, linked as a stack
+
+# later, trunk moved:
+gh wt stack rebase && gh stack push
+
+# after review:
+gh stack merge
+gh wt rm MCL-123-feature
+```
 
 
 Show status for all worktrees:

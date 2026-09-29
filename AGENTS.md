@@ -128,9 +128,10 @@ gh wt --help
 - **Fetches prune:** renaming a branch leaves a stale remote-tracking ref that
   makes the next plain `git fetch` fail with a directory/file conflict, so
   every fetch gh-wt runs passes `--prune`.
-- **The bottom layer is the host:** it carries gh stack's metadata and is the
-  one layer without its own separate worktree, because `gh stack view --json`
+- **The bottom layer is the host:** its worktree carries gh stack's metadata
+  and is the one layer gh-wt never detaches, because `gh stack view --json`
   exits 2 on a detached HEAD and `gh wt status` would silently lose the stack.
+  Every raw `gh stack` command therefore has to run from the host's folder.
 - **gh stack only adds at the top:** so `gh wt stack add` detaches the layer
   worktrees, climbs with `gh stack top`, adds, parks the host back on layer 1,
   and reattaches. Detaching preserves each working tree exactly, so an agent's
@@ -165,6 +166,23 @@ gh wt --help
   worktree's git dir from its `.git` pointer file rather than calling
   `git rev-parse --git-dir`. gh stack stores metadata per-worktree
   (`.bare/worktrees/<name>/gh-stack`), never in the common dir.
+- **Nested renames go through a sibling:** GitHub's rename API rejects
+  `a` -> `a/01` as "not a valid branch name" (422) while `a` still occupies the
+  path, so `rename_remote_branch` renames to `<old>.gh-wt-rename` first. GitHub
+  keeps serving the old ref for a second or two after the rename returns, so
+  it polls (`wait_for_remote_branch_to_go`) before the second step.
+- **Renames repoint the upstream in config:** `git branch -m` carries the old
+  `branch.<name>.merge` over verbatim, leaving the layer tracking a remote
+  branch that no longer exists. `rename_stack_branch` writes the new one
+  directly rather than using `--set-upstream-to`, which needs the fetch to have
+  already produced `origin/<new>`.
+- **The container is a valid starting point:** it is a plain directory, so
+  `git rev-parse --show-toplevel` fails there. `find_stack_host` treats a
+  directory that is not a worktree as the container itself, which is what lets
+  `add`, `rename`, and `rebase` run from it.
+- **The setup hook gets `<container>/<layer>`:** hooks resolve their argument
+  against the repo root, and a layer sits one level down. Passing the bare
+  layer folder name broke every hook that checks the directory exists.
 - **Metadata is written, not just read:** `git branch -m` leaves gh stack naming
   a branch that no longer exists, so `rename` rewrites the metadata too.
 - **Live PR state comes from `gh stack view --json`:** one call replaces N
