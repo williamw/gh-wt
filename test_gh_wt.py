@@ -3291,6 +3291,31 @@ def stack_repo(tmp_path: Path) -> StackRepo:
 
 
 @requires_gh_stack
+class TestRenameKeepsUpstream:
+    """A renamed layer tracks its renamed remote branch, not the old name."""
+
+    def test_convert_then_rename_points_upstream_at_the_new_name(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def rename_on_origin(old: str, new: str, cwd: Path) -> bool:
+            git("branch", "-m", old, new, cwd=stack_repo.origin)
+            return True
+
+        monkeypatch.chdir(stack_repo.worktree)
+        monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", rename_on_origin)
+
+        assert run_cli(["stack"]).exit_code == 0
+        layer = stack_repo.worktree / "01"
+        assert git("rev-parse", "--abbrev-ref", "@{u}", cwd=layer) == "origin/billw/some-feature/01"
+
+        monkeypatch.chdir(layer)
+        assert run_cli(["stack", "rename", "01", "01-docs"]).exit_code == 0
+        layer = stack_repo.worktree / "01-docs"
+        assert git("rev-parse", "--abbrev-ref", "@{u}", cwd=layer) == "origin/billw/some-feature/01-docs"
+
+
+@requires_gh_stack
 class TestConvertIntegration:
     """gh wt stack converts in place against a real repo."""
 

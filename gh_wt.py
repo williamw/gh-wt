@@ -737,13 +737,23 @@ def ensure_rename_is_allowed(branch: str, action: str) -> None:
 
 
 def rename_stack_branch(old: str, new: str, bare_dir: Path, worktree_path: Path) -> None:
-    """Rename a layer branch locally and on origin, then refresh tracking refs."""
-    if remote_branch_exists(bare_dir, old):
+    """Rename a layer branch locally and on origin, then refresh tracking refs.
+
+    git branch -m carries the old upstream over verbatim, so the renamed branch
+    would keep tracking a remote name that no longer exists. It is repointed
+    in config rather than with --set-upstream-to, which needs the fetch above
+    to have already produced origin/<new>.
+    """
+    on_origin = remote_branch_exists(bare_dir, old)
+    if on_origin:
         if not rename_remote_branch(old, new, worktree_path):
             sys.exit(1)
 
     run_git(["branch", "-m", old, new], cwd=str(bare_dir))
     run_git(["fetch", "--prune", "origin"], cwd=str(bare_dir), check=False)
+    if on_origin:
+        run_git(["config", f"branch.{new}.remote", "origin"], cwd=str(bare_dir))
+        run_git(["config", f"branch.{new}.merge", f"refs/heads/{new}"], cwd=str(bare_dir))
 
 
 def move_worktree_into_container(bare_dir: Path, worktree_path: Path, folder: str) -> Path:
