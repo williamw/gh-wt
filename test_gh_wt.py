@@ -3508,6 +3508,17 @@ class TestRenameLayerIntegration:
         metadata = gh_wt.read_stack_metadata(stack_repo.worktree / "01-base")
         assert gh_wt.stack_layers(metadata) == ["billw/some-feature/01-base"]
 
+    def test_renames_from_the_container_folder(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stack(stack_repo, monkeypatch)
+        monkeypatch.chdir(stack_repo.worktree)
+
+        result = run_cli(["stack", "--rename", "01", "01-base"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "01-base").is_dir()
+
     def test_renames_a_layer_above_the_host(
         self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
     ) -> None:

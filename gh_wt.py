@@ -787,15 +787,16 @@ def find_stack_host(repo_root: Path, start: Path) -> Optional[Path]:
 
     Layers are sibling worktrees inside one container folder, and only the
     bottom layer carries gh stack's metadata, so a layer finds its host by
-    looking across the container rather than at itself.
+    looking across the container rather than at itself. The container is a
+    plain directory, so from there `start` itself is the container.
     """
-    toplevel = Path(
-        run_git(["rev-parse", "--show-toplevel"], cwd=str(start), check=False)
-    )
-    if read_stack_metadata(toplevel):
-        return toplevel
-
-    container = toplevel.parent
+    toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=str(start), check=False)
+    if not toplevel:
+        container = start.resolve()
+    elif read_stack_metadata(Path(toplevel)):
+        return Path(toplevel)
+    else:
+        container = Path(toplevel).parent
     for _, _, path in get_worktree_branches(repo_root):
         candidate = Path(path)
         if candidate.parent == container and read_stack_metadata(candidate):
