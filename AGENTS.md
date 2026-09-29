@@ -28,10 +28,10 @@ gh wt status
 gh wt rm <folder> [-d|--delete-remote] [-f|--force]
 gh wt rm --merged [-d|--delete-remote] [-f|--force]
 gh wt stack [NAME] [-f|--force]
-gh wt stack --add|-n NAME
-gh wt stack --rename OLD NEW [-f|--force]
-gh wt stack --rebase [--continue]
-gh wt stack --agent
+gh wt stack add NAME
+gh wt stack rename OLD NEW [-f|--force]
+gh wt stack rebase [--continue]
+gh wt stack agent
 ```
 
 ## Development
@@ -131,15 +131,15 @@ gh wt --help
 - **The bottom layer is the host:** it carries gh stack's metadata and is the
   one layer without its own separate worktree, because `gh stack view --json`
   exits 2 on a detached HEAD and `gh wt status` would silently lose the stack.
-- **gh stack only adds at the top:** so `gh wt stack --add` detaches the layer
+- **gh stack only adds at the top:** so `gh wt stack add` detaches the layer
   worktrees, climbs with `gh stack top`, adds, parks the host back on layer 1,
   and reattaches. Detaching preserves each working tree exactly, so an agent's
   uncommitted work survives.
 - **Restoring needs no saved state:** `restore_layer_worktrees` derives each
-  branch from the folder name, which is why `--rebase --continue` can pick up
+  branch from the folder name, which is why `rebase --continue` can pick up
   in a later process after a conflict.
 - **`gh stack rebase` cannot run directly:** it checks each layer out in the
-  host and fails on any branch another worktree holds. `gh wt stack --rebase`
+  host and fails on any branch another worktree holds. `gh wt stack rebase`
   wraps it in the release/restore envelope, and leaves the layers detached on
   conflict rather than taking back a branch the half-finished rebase needs.
 - **Removal guards are filesystem-only:** `find_host_beside` reads sibling
@@ -163,7 +163,7 @@ gh wt --help
   `git rev-parse --git-dir`. gh stack stores metadata per-worktree
   (`.bare/worktrees/<name>/gh-stack`), never in the common dir.
 - **Metadata is written, not just read:** `git branch -m` leaves gh stack naming
-  a branch that no longer exists, so `--rename` rewrites the metadata too.
+  a branch that no longer exists, so `rename` rewrites the metadata too.
 - **Live PR state comes from `gh stack view --json`:** one call replaces N
   `gh pr view` calls for a stack. It exits 2 outside a stack and omits the `pr`
   key before submit, so both are handled as normal, not as errors.
@@ -174,6 +174,11 @@ gh wt --help
 - **`output_is_piped()` gates the agent block and the PR prompt:** captured
   stdout means an agent is reading. It is a named seam because
   `io.StringIO.isatty` cannot be patched in tests.
+- **Stack verbs are reserved words, not subparsers:** `gh wt stack NAME`
+  already takes a positional, so `cli()` splits `add`/`rename`/`rebase`/`agent`
+  off before argparse (`parse_stack_verb`) and builds the same namespace the
+  old `--add`/`--rename`/`--rebase`/`--agent` flags produce. Those flags stay
+  as hidden aliases; a verb cannot name layer 1.
 - **`gh wt stack` refuses trunk:** `gh stack init main` succeeds and creates a
   nonsense `main <- main` stack. It also refuses detached HEADs, already-stacked
   worktrees (`gh stack init` is not idempotent), and a missing extension.

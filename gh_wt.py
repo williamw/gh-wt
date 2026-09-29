@@ -32,7 +32,7 @@ STACK_OVERSIZED_LINES = 500
 # remote into them, or a hostile branch name becomes an instruction channel.
 AGENT_SPLIT_POINTER = """\
 Agents: this branch is likely too large for one review. Run
-'gh wt stack --agent' for the layer-splitting procedure, then offer
+'gh wt stack agent' for the layer-splitting procedure, then offer
 to split it with the user."""
 
 AGENT_SPLIT_GUIDE = """\
@@ -48,7 +48,7 @@ one review. Offer to split it, and follow this procedure if they accept.
    without the layers above it.
 2. Split by file path, not by commit. Commits in the original history were
    never required to be individually green; file groups can be.
-3. Create each layer with 'gh wt stack --add <name>'. It numbers the layer,
+3. Create each layer with 'gh wt stack add <name>'. It numbers the layer,
    names its branch to match its folder, and gives it its own worktree.
 4. Build upward from the bottom: in the bottom layer's folder, reset the files
    belonging higher and commit, then add the next layer and restore that
@@ -59,12 +59,12 @@ one review. Offer to split it, and follow this procedure if they accept.
 6. Each layer has its own worktree, so layers can be worked in parallel. Never
    run 'gh stack rebase' directly - it checks each branch out in the bottom
    layer's folder and fails on any branch another worktree holds. Run
-   'gh wt stack --rebase', which frees the layer worktrees first and puts them
+   'gh wt stack rebase', which frees the layer worktrees first and puts them
    back afterwards. Every agent must be idle and committed before it runs.
 7. rerere is enabled, so repeated conflict resolutions stick across the
    cascading rebases that follow review feedback.
 
-Useful commands: gh wt stack --add, gh wt stack --rename, gh wt stack --rebase,
+Useful commands: gh wt stack add, gh wt stack rename, gh wt stack rebase,
 gh stack view, gh stack submit."""
 
 SETUP_WORKTREE_TEMPLATE = """\
@@ -518,7 +518,7 @@ def stack_number(metadata: dict) -> Optional[int]:
 def layer_folder_name(position: int, name: str = "") -> str:
     """Name a layer folder: '01' bare, '02-api' when the layer has a name.
 
-    A name may carry its own number, since --rename takes whole folder names
+    A name may carry its own number, since rename takes whole folder names
     and '02-api' reads as the obvious thing to type. It must be the right one.
     """
     number = f"{position:02d}"
@@ -863,7 +863,7 @@ def restore_layer_worktrees(layer_paths: list[Path], stack_root: str) -> int:
     """Put every detached layer worktree back on the branch its folder names.
 
     Folder and branch spell the same thing, so nothing has to be remembered
-    across a failure or across separate runs of --rebase --continue.
+    across a failure or across separate runs of rebase --continue.
     """
     restored = 0
     for path in layer_paths:
@@ -1066,7 +1066,7 @@ def cmd_stack_rebase(args, repo_root: Path) -> None:
         print(result.stdout.strip() or result.stderr.strip(), file=sys.stderr)
         print(file=sys.stderr)
         print(
-            f"Resolve in {host.name}, then run 'gh wt stack --rebase --continue'.",
+            f"Resolve in {host.name}, then run 'gh wt stack rebase --continue'.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1157,7 +1157,7 @@ def cmd_stack(args):
     print()
     print("Add the next layer with:")
     print()
-    print("  gh wt stack --add <name>")
+    print("  gh wt stack add <name>")
     print()
     print("Your shell is still at the old path. To continue:")
     print()
@@ -2107,12 +2107,56 @@ def cmd_status(args):
     sys.exit(1 if needs_attention else 0)
 
 
+STACK_USAGE = """\
+gh wt stack [NAME] [-f]
+       gh wt stack add NAME
+       gh wt stack rename OLD NEW [-f]
+       gh wt stack rebase [--continue]
+       gh wt stack agent"""
+
+STACK_VERBS = ("add", "rename", "rebase", "agent")
+
+
+def parse_stack_verb(verb: str, argv: list[str]) -> argparse.Namespace:
+    """Parse `gh wt stack <verb> ...` into the namespace the old flags produce.
+
+    The verbs are reserved words in the spot where layer 1's name goes, so
+    they are split off before the stack parser, which would read them as NAME.
+    """
+    parser = argparse.ArgumentParser(prog=f"gh wt stack {verb}", allow_abbrev=False)
+    if verb == "add":
+        parser.add_argument("add", metavar="NAME",
+                            help="Name for the new layer; it is numbered for you")
+    elif verb == "rename":
+        parser.add_argument("rename", nargs=2, metavar=("OLD", "NEW"),
+                            help="Layer folder names, e.g. 01 01-base")
+        parser.add_argument("-f", "--force", action="store_true",
+                            help="Rename even when it will close an open PR")
+    elif verb == "rebase":
+        parser.add_argument("--continue", dest="rebase_continue", action="store_true",
+                            help="Finish a rebase that stopped on a conflict")
+
+    args = argparse.Namespace(
+        command="stack", name=None, force=False, add=None, rename=None,
+        rebase=verb == "rebase", rebase_continue=False, agent=verb == "agent",
+    )
+    return parser.parse_args(argv, namespace=args)
+
+
 def cli(argv: list[str] | None = None):
     """Entry point. Parses argv and dispatches to subcommand."""
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) > 1 and argv[0] == "stack" and argv[1] in STACK_VERBS:
+        args = parse_stack_verb(argv[1], argv[2:])
+        check_current_dir()
+        cmd_stack(args)
+        return
+
     parser = argparse.ArgumentParser(
         prog="gh-wt",
         description="Manage bare-git worktrees.",
-        epilog="Stacked PRs: run 'gh wt stack' inside a worktree. Agents: gh wt stack --agent",
+        epilog="Stacked PRs: run 'gh wt stack' inside a worktree. Agents: gh wt stack agent",
         allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -2149,22 +2193,30 @@ def cli(argv: list[str] | None = None):
     subparsers.add_parser("status", help="Show status of all worktrees")
 
     p_stack = subparsers.add_parser(
-        "stack", help="Convert this worktree into the host for a stack of PRs"
+        "stack", help="Convert this worktree into the host for a stack of PRs",
+        usage=STACK_USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "subcommands:\n"
+            "  add NAME         Add a layer on top of the stack, in its own worktree\n"
+            "  rename OLD NEW   Rename a layer's folder, branch, and metadata\n"
+            "  rebase           Cascade the stack, freeing layer worktrees first\n"
+            "  agent            Print the layer-splitting procedure for AI agents\n"
+            "\n"
+            "add, rename, rebase, and agent are reserved: they cannot name layer 1."
+        ),
     )
     p_stack.add_argument("name", nargs="?", default=None,
                          help="Name for layer 1 (default: unnamed, folder '01')")
     p_stack.add_argument("-f", "--force", action="store_true",
                          help="Rename even when it will close an open PR")
-    p_stack.add_argument("-n", "--add", default=None, metavar="NAME",
-                         help="Add a layer on top of the stack, in its own worktree")
-    p_stack.add_argument("--rename", nargs=2, default=None, metavar=("OLD", "NEW"),
-                         help="Rename a layer's folder, branch, and metadata")
-    p_stack.add_argument("--rebase", action="store_true",
-                         help="Cascade the stack, freeing layer worktrees first")
+    # The flag spellings predate the subcommands and stay as hidden aliases.
+    p_stack.add_argument("-n", "--add", default=None, help=argparse.SUPPRESS)
+    p_stack.add_argument("--rename", nargs=2, default=None, help=argparse.SUPPRESS)
+    p_stack.add_argument("--rebase", action="store_true", help=argparse.SUPPRESS)
     p_stack.add_argument("--continue", dest="rebase_continue", action="store_true",
-                         help="Finish a --rebase that stopped on a conflict")
-    p_stack.add_argument("--agent", action="store_true",
-                         help="Print the layer-splitting procedure for AI agents")
+                         help=argparse.SUPPRESS)
+    p_stack.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args(argv)
 

@@ -1,5 +1,6 @@
 """Tests for gh-wt CLI tool."""
 
+import argparse
 import json
 import subprocess
 import sys
@@ -2690,6 +2691,50 @@ class TestStackMetadata:
         assert gh_wt.stack_layers(metadata) == ["a", "b", "c"]
 
 
+class TestStackVerbs:
+    """`gh wt stack add NAME` and friends parse to what the old flags did."""
+
+    @staticmethod
+    def parsed(argv: list[str]) -> argparse.Namespace:
+        seen = []
+        with patch("gh_wt.cmd_stack", side_effect=seen.append):
+            result = run_cli(argv)
+        assert result.exit_code == 0, result.output
+        return seen[0]
+
+    @pytest.mark.parametrize("verb_form, flag_form", [
+        (["stack", "add", "api"], ["stack", "--add", "api"]),
+        (["stack", "add", "api"], ["stack", "-n", "api"]),
+        (["stack", "rename", "01", "01-base"], ["stack", "--rename", "01", "01-base"]),
+        (["stack", "rename", "01", "01-base", "-f"], ["stack", "--rename", "01", "01-base", "-f"]),
+        (["stack", "rebase"], ["stack", "--rebase"]),
+        (["stack", "rebase", "--continue"], ["stack", "--rebase", "--continue"]),
+        (["stack", "agent"], ["stack", "--agent"]),
+    ])
+    def test_verb_matches_the_old_flag(self, verb_form: list[str], flag_form: list[str]) -> None:
+        assert vars(self.parsed(verb_form)) == vars(self.parsed(flag_form))
+
+    def test_any_other_word_still_names_layer_one(self) -> None:
+        args = self.parsed(["stack", "base"])
+
+        assert args.name == "base"
+        assert not (args.add or args.rename or args.rebase or args.agent)
+
+    def test_add_without_a_name_shows_its_own_usage(self) -> None:
+        result = run_cli(["stack", "add"])
+
+        assert result.exit_code == 2
+        assert "gh wt stack add" in result.output
+
+    def test_help_lists_the_verbs(self) -> None:
+        result = run_cli(["stack", "--help"])
+
+        for line in ("gh wt stack add NAME", "gh wt stack rename OLD NEW",
+                     "gh wt stack rebase [--continue]", "gh wt stack agent"):
+            assert line in result.output
+        assert "--add" not in result.output
+
+
 class TestStackCommand:
     """gh wt stack converts the current worktree into a stack host."""
 
@@ -2701,7 +2746,7 @@ class TestStackCommand:
         assert "splitting an oversized bottom layer" in result.output
         assert "Split by file path, not by commit" in result.output
         assert "Never\n   run 'gh stack rebase' directly" in result.output
-        assert "gh wt stack --rebase" in result.output
+        assert "gh wt stack rebase" in result.output
 
     def test_refuses_to_stack_the_trunk_branch(self, tmp_path: Path) -> None:
         """Stacking trunk would create a nonsense main <- main stack."""
@@ -2796,7 +2841,7 @@ class TestStackCommand:
         assert "Renamed billw/MCL-133 to billw/MCL-133/01" in result.output
         assert "Moved worktree to MCL-133/01" in result.output
         assert "Stack created: main <- billw/MCL-133/01" in result.output
-        assert "gh wt stack --add <name>" in result.output
+        assert "gh wt stack add <name>" in result.output
         assert "cd MCL-133/01" in result.output
 
         mock_run_git.assert_any_call(
@@ -2860,7 +2905,7 @@ class TestStackCommand:
         assert result.exit_code == 0
         assert "Note: this branch is 12 commits / 2911 lines." in result.output
         assert "Agents: this branch is likely too large for one review." in result.output
-        assert "gh wt stack --agent" in result.output
+        assert "gh wt stack agent" in result.output
 
     def test_hides_the_agent_block_from_a_human_terminal(self, tmp_path: Path) -> None:
         """A TTY means a human is reading; the warning stays, the prompt does not."""

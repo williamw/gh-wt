@@ -223,7 +223,7 @@ gh wt stack base
 Conversion renames the branch to `billw/some-feature/01-base`, moves the
 worktree to `some-feature/01-base/`, and turns `some-feature/` into a plain
 container folder holding the layers. The name argument is optional: without it
-layer 1 is just `01`, and `gh wt stack --rename 01 01-base` renames it later.
+layer 1 is just `01`, and `gh wt stack rename 01 01-base` renames it later.
 Conversion also enables `git rerere` in the shared `.bare/config`, which
 `gh stack init` does not do despite its README.
 
@@ -231,9 +231,14 @@ Add layers, each in its own worktree:
 
 ```bash
 cd 01-base
-gh wt stack --add api      # -> some-feature/02-api, billw/some-feature/02-api
-gh wt stack --add ui       # -> some-feature/03-ui,  billw/some-feature/03-ui
+gh wt stack add api      # -> some-feature/02-api, billw/some-feature/02-api
+gh wt stack add ui       # -> some-feature/03-ui,  billw/some-feature/03-ui
 ```
+
+The number is added for you; `gh wt stack add 02-api` also works, but a number
+that is not the next layer's is refused. `add`, `rename`, `rebase`, and `agent`
+are reserved words, so they cannot name layer 1. The older flag spellings
+(`--add`, `--rename`, `--rebase`, `--agent`) still work.
 
 ```text
 some-feature/
@@ -250,26 +255,26 @@ block `billw/some-feature/02-api` from ever being created.
 **Renaming layer 1 closes an open PR on it.** GitHub closes any pull request
 whose head branch is renamed. `gh wt stack` prompts before doing it, and a run
 whose output is captured — an agent, a script — fails instead, so `--force` is
-required to go ahead. `gh wt stack --rename` is gated the same way.
+required to go ahead. `gh wt stack rename` is gated the same way.
 
 **The bottom layer is the host.** It holds `gh stack`'s metadata and is the
 only layer without a separate worktree of its own, because `gh stack view`
 needs the host on a branch. `gh stack add` also only works at the top of a
-stack, so `gh wt stack --add` briefly detaches the layer worktrees above,
+stack, so `gh wt stack add` briefly detaches the layer worktrees above,
 climbs, adds, and puts them back. Uncommitted work in those folders is
 preserved.
 
-**Cascade with `gh wt stack --rebase`, never `gh stack rebase`.** The latter
+**Cascade with `gh wt stack rebase`, never `gh stack rebase`.** The latter
 checks each layer out in turn and dies on any branch another worktree holds.
-`--rebase` detaches every layer worktree first and restores it afterwards:
+It detaches every layer worktree first and restores it afterwards:
 
 ```bash
-gh wt stack --rebase
+gh wt stack rebase
 ```
 
 Every agent must be idle and committed when it runs. On a conflict the layers
 are left detached and the message points you at the host folder; resolve there
-and run `gh wt stack --rebase --continue`.
+and run `gh wt stack rebase --continue`.
 
 `gh wt stack` refuses to run on the trunk worktree, on a detached HEAD, on a
 worktree that already hosts a stack, and when the `gh stack` extension is
@@ -278,8 +283,8 @@ missing. Install it with `gh extension install github/gh-stack`.
 If the adopted branch is still too large for one review (more than 3 commits
 or 500 changed lines), `gh wt stack` says so. When its output is being captured
 rather than shown in a terminal — as when an AI agent runs it — it also prints
-a short block pointing at `gh wt stack --agent`, which prints the full
-layer-splitting procedure. Run `gh wt stack --agent` yourself to see exactly
+a short block pointing at `gh wt stack agent`, which prints the full
+layer-splitting procedure. Run `gh wt stack agent` yourself to see exactly
 what agents are told.
 
 `gh wt status` renders a stack once, under its container, rather than once per
