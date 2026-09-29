@@ -951,6 +951,14 @@ def cmd_stack_add(args, repo_root: Path) -> None:
     run_git(["worktree", "add", str(layer_path), layer_branch], cwd=str(bare_dir))
     print(f"Created {layer_branch}")
 
+    # Pushed like `gh wt add` does. The layer already exists by now, so a
+    # failed push is a warning: gh stack submit pushes it later anyway.
+    if not args.local:
+        pushed = run_git_result(["push", "-u", "origin", layer_branch], cwd=str(layer_path))
+        if pushed.returncode != 0:
+            print(f"Warning: could not push {layer_branch}; the layer is local only.", file=sys.stderr)
+            print(pushed.stderr.strip(), file=sys.stderr)
+
     # The hook takes the worktree's path under the repo root, and a layer sits
     # one level down, inside its container.
     hook_arg = str(layer_path.relative_to(repo_root))
@@ -2119,7 +2127,7 @@ def cmd_status(args):
 
 STACK_USAGE = """\
 gh wt stack [NAME] [-f]
-       gh wt stack add NAME
+       gh wt stack add NAME [-L]
        gh wt stack rename OLD NEW [-f]
        gh wt stack rebase [--continue]
        gh wt stack agent"""
@@ -2137,6 +2145,8 @@ def parse_stack_verb(verb: str, argv: list[str]) -> argparse.Namespace:
     if verb == "add":
         parser.add_argument("add", metavar="NAME",
                             help="Name for the new layer; it is numbered for you")
+        parser.add_argument("-L", "--local", action="store_true",
+                            help="Create the layer locally without pushing to origin")
     elif verb == "rename":
         parser.add_argument("rename", nargs=2, metavar=("OLD", "NEW"),
                             help="Layer folder names, e.g. 01 01-base")
@@ -2147,7 +2157,7 @@ def parse_stack_verb(verb: str, argv: list[str]) -> argparse.Namespace:
                             help="Finish a rebase that stopped on a conflict")
 
     args = argparse.Namespace(
-        command="stack", name=None, force=False, add=None, rename=None,
+        command="stack", name=None, force=False, add=None, local=False, rename=None,
         rebase=verb == "rebase", rebase_continue=False, agent=verb == "agent",
     )
     return parser.parse_args(argv, namespace=args)
@@ -2222,6 +2232,7 @@ def cli(argv: list[str] | None = None):
                          help="Rename even when it will close an open PR")
     # The flag spellings predate the subcommands and stay as hidden aliases.
     p_stack.add_argument("-n", "--add", default=None, help=argparse.SUPPRESS)
+    p_stack.add_argument("-L", "--local", action="store_true", help=argparse.SUPPRESS)
     p_stack.add_argument("--rename", nargs=2, default=None, help=argparse.SUPPRESS)
     p_stack.add_argument("--rebase", action="store_true", help=argparse.SUPPRESS)
     p_stack.add_argument("--continue", dest="rebase_continue", action="store_true",

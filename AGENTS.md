@@ -28,7 +28,7 @@ gh wt status
 gh wt rm <folder> [-d|--delete-remote] [-f|--force]
 gh wt rm --merged [-d|--delete-remote] [-f|--force]
 gh wt stack [NAME] [-f|--force]
-gh wt stack add NAME
+gh wt stack add NAME [-L|--local]
 gh wt stack rename OLD NEW [-f|--force]
 gh wt stack rebase [--continue]
 gh wt stack agent
@@ -135,6 +135,9 @@ gh wt --help
   worktrees, climbs with `gh stack top`, adds, parks the host back on layer 1,
   and reattaches. Detaching preserves each working tree exactly, so an agent's
   uncommitted work survives.
+- **`stack add` pushes like `add`:** the new layer goes to origin with `-u`
+  unless `-L`/`--local`. The worktree already exists by then, so a failed push
+  warns instead of failing; `gh stack submit` pushes it later anyway.
 - **Restoring needs no saved state:** `restore_layer_worktrees` derives each
   branch from the folder name, which is why `rebase --continue` can pick up
   in a later process after a conflict.

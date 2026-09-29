@@ -2705,6 +2705,7 @@ class TestStackVerbs:
     @pytest.mark.parametrize("verb_form, flag_form", [
         (["stack", "add", "api"], ["stack", "--add", "api"]),
         (["stack", "add", "api"], ["stack", "-n", "api"]),
+        (["stack", "add", "api", "-L"], ["stack", "--add", "api", "--local"]),
         (["stack", "rename", "01", "01-base"], ["stack", "--rename", "01", "01-base"]),
         (["stack", "rename", "01", "01-base", "-f"], ["stack", "--rename", "01", "01-base", "-f"]),
         (["stack", "rebase"], ["stack", "--rebase"]),
@@ -3243,6 +3244,11 @@ class StackRepo:
         listing = git("branch", "--format=%(refname:short)", cwd=self.bare)
         return sorted(line for line in listing.split("\n") if line)
 
+    def rename_on_origin(self, old: str, new: str, cwd: Path) -> bool:
+        """Stand-in for rename_remote_branch: rename on origin, as GitHub would."""
+        git("branch", "-m", old, new, cwd=self.origin)
+        return True
+
     def worktree_paths(self) -> list[str]:
         listing = git("worktree", "list", "--porcelain", cwd=self.bare)
         paths = (
@@ -3297,13 +3303,9 @@ class TestRenameKeepsUpstream:
     def test_convert_then_rename_points_upstream_at_the_new_name(
         self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def rename_on_origin(old: str, new: str, cwd: Path) -> bool:
-            git("branch", "-m", old, new, cwd=stack_repo.origin)
-            return True
-
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", rename_on_origin)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
 
         assert run_cli(["stack"]).exit_code == 0
         layer = stack_repo.worktree / "01"
@@ -3324,7 +3326,7 @@ class TestConvertIntegration:
     ) -> None:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
 
         result = run_cli(["stack", "base"])
 
@@ -3343,7 +3345,7 @@ class TestConvertIntegration:
     ) -> None:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
 
         result = run_cli(["stack"])
 
@@ -3453,7 +3455,7 @@ class TestAddLayerIntegration:
     def _convert(self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
         assert run_cli(["stack", "base"]).exit_code == 0
         layer_one = stack_repo.worktree / "01-base"
         monkeypatch.chdir(layer_one)
@@ -3490,6 +3492,40 @@ class TestAddLayerIntegration:
         assert result.exit_code == 0
         assert (stack_repo.root / "hook-arg").read_text().strip() == "some-feature/02-api"
         assert "cd 02-api" in result.output
+
+    def test_pushes_the_new_layer_and_tracks_it(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+
+        assert run_cli(["stack", "add", "api"]).exit_code == 0
+
+        assert git("branch", "--list", "billw/some-feature/02-api", cwd=stack_repo.origin)
+        assert git("rev-parse", "--abbrev-ref", "@{u}", cwd=stack_repo.worktree / "02-api") == (
+            "origin/billw/some-feature/02-api"
+        )
+
+    def test_local_skips_the_push(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+
+        assert run_cli(["stack", "add", "api", "-L"]).exit_code == 0
+
+        assert (stack_repo.worktree / "02-api").is_dir()
+        assert not git("branch", "--list", "billw/some-feature/02-api", cwd=stack_repo.origin)
+
+    def test_a_failed_push_keeps_the_layer(
+        self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._convert(stack_repo, monkeypatch)
+        git("config", "remote.origin.pushurl", str(stack_repo.root / "nowhere.git"), cwd=stack_repo.bare)
+
+        result = run_cli(["stack", "add", "api"])
+
+        assert result.exit_code == 0
+        assert (stack_repo.worktree / "02-api").is_dir()
+        assert "could not push billw/some-feature/02-api" in result.output
 
     def test_accepts_the_layer_number_in_the_name(
         self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch
@@ -3598,7 +3634,7 @@ class TestRenameLayerIntegration:
     def _stack(self, stack_repo: StackRepo, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
         assert run_cli(["stack"]).exit_code == 0
         layer_one = stack_repo.worktree / "01"
         monkeypatch.chdir(layer_one)
@@ -3693,7 +3729,7 @@ class TestStackRemovalIntegration:
     ) -> Path:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
         assert run_cli(["stack", "base"]).exit_code == 0
         layer_one = stack_repo.worktree / "01-base"
         monkeypatch.chdir(layer_one)
@@ -3771,7 +3807,7 @@ class TestRebaseIntegration:
     ) -> Path:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
         assert run_cli(["stack", "base"]).exit_code == 0
         layer_one = stack_repo.worktree / "01-base"
         monkeypatch.chdir(layer_one)
@@ -3850,7 +3886,7 @@ class TestStackStatusIntegration:
     ) -> None:
         monkeypatch.chdir(stack_repo.worktree)
         monkeypatch.setattr(gh_wt, "get_pr_info", lambda branch: None)
-        monkeypatch.setattr(gh_wt, "rename_remote_branch", lambda old, new, cwd: True)
+        monkeypatch.setattr(gh_wt, "rename_remote_branch", stack_repo.rename_on_origin)
         assert run_cli(["stack", "base"]).exit_code == 0
         monkeypatch.chdir(stack_repo.worktree / "01-base")
         assert run_cli(["stack", "--add", "api"]).exit_code == 0

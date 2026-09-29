@@ -235,9 +235,11 @@ gh wt stack add api      # -> some-feature/02-api, billw/some-feature/02-api
 gh wt stack add ui       # -> some-feature/03-ui,  billw/some-feature/03-ui
 ```
 
-The number is added for you; `gh wt stack add 02-api` also works, but a number
-that is not the next layer's is refused. `add`, `rename`, `rebase`, and `agent`
-are reserved words, so they cannot name layer 1. The older flag spellings
+Each new layer is pushed to origin with an upstream, like `gh wt add`; pass
+`-L`/`--local` to keep it local until `gh stack submit`. The number is added
+for you; `gh wt stack add 02-api` also works, but a number that is not the next
+layer's is refused. `add`, `rename`, `rebase`, and `agent` are reserved words,
+so they cannot name layer 1. The older flag spellings
 (`--add`, `--rename`, `--rebase`, `--agent`) still work.
 
 ```text
