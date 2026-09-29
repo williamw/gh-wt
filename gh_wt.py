@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -646,7 +647,20 @@ def rename_remote_branch(old: str, new: str, cwd: Path) -> bool:
 
     GitHub retargets PRs based on the branch but closes the one it heads, so
     callers gate this behind an explicit confirmation.
+
+    GitHub rejects a rename where one name nests under the other (layer 1's
+    `feat` -> `feat/01-base`) as an invalid branch name, because the old ref
+    still occupies the path. Those go through a sibling name first, waiting
+    out the moment GitHub keeps the old ref after a rename returns.
     """
+    if new.startswith(f"{old}/") or old.startswith(f"{new}/"):
+        temp = f"{old}.gh-wt-rename"
+        return (
+            rename_remote_branch(old, temp, cwd)
+            and wait_for_remote_branch_to_go(old, cwd)
+            and rename_remote_branch(temp, new, cwd)
+        )
+
     result = subprocess.run(
         ["gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/branches/{old}/rename",
          "-f", f"new_name={new}"],
@@ -660,6 +674,28 @@ def rename_remote_branch(old: str, new: str, cwd: Path) -> bool:
         print(result.stderr.strip() or result.stdout.strip(), file=sys.stderr)
         return False
     return True
+
+
+REMOTE_BRANCH_GONE_TIMEOUT = 15.0
+
+
+def wait_for_remote_branch_to_go(branch: str, cwd: Path) -> bool:
+    """Poll until GitHub stops serving a branch it has just renamed away."""
+    deadline = time.monotonic() + REMOTE_BRANCH_GONE_TIMEOUT
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/git/ref/heads/{branch}"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return True
+        time.sleep(0.5)
+
+    print(f"Error: origin still has {branch} after renaming it away.", file=sys.stderr)
+    return False
 
 
 def ensure_rename_is_allowed(branch: str, action: str) -> None:

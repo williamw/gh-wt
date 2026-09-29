@@ -2588,6 +2588,52 @@ STACK_VIEW = {
 }
 
 
+class TestRenameRemoteBranch:
+    """Renaming a branch through the GitHub API."""
+
+    @staticmethod
+    def renamed_names(mock_run: MagicMock) -> list[tuple[str, str]]:
+        """(old, new) pairs from each rename API call, in order."""
+        pairs = []
+        for call in mock_run.call_args_list:
+            argv = call.args[0]
+            if "-X" not in argv:
+                continue
+            old = argv[4].removeprefix("repos/{owner}/{repo}/branches/").removesuffix("/rename")
+            pairs.append((old, argv[-1].removeprefix("new_name=")))
+        return pairs
+
+    def test_renames_in_one_call_when_names_do_not_nest(self, tmp_path: Path) -> None:
+        with patch("gh_wt.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert gh_wt.rename_remote_branch("billw/feat", "billw/feat-2", tmp_path)
+
+        assert self.renamed_names(mock_run) == [("billw/feat", "billw/feat-2")]
+
+    def test_goes_through_a_sibling_when_the_new_name_nests_under_the_old(
+        self, tmp_path: Path
+    ) -> None:
+        # GitHub rejects billw/feat -> billw/feat/01-base as "not a valid branch
+        # name" (422), because the old ref still occupies the path.
+        lingering = iter([0, 0, 1])
+
+        def fake_run(argv, **kwargs):
+            if argv[2].endswith("/git/ref/heads/billw/feat"):
+                return MagicMock(returncode=next(lingering), stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("gh_wt.subprocess.run", side_effect=fake_run) as mock_run, \
+                patch("gh_wt.time.sleep"):
+            assert gh_wt.rename_remote_branch("billw/feat", "billw/feat/01-base", tmp_path)
+
+        temp = "billw/feat.gh-wt-rename"
+        assert self.renamed_names(mock_run) == [
+            ("billw/feat", temp),
+            (temp, "billw/feat/01-base"),
+        ]
+        assert next(lingering, None) is None, "should wait until the old ref is gone"
+
+
 class TestStackMetadata:
     """Reading gh stack's per-worktree metadata off disk."""
 
