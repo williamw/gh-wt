@@ -452,6 +452,7 @@ class TestCloneWorkflow:
 
             # Assert: Directory structure was created
             assert (tmp_path / "test-repo" / ".bare").exists(), "Expected .bare/ to be created"
+            assert (tmp_path / "test-repo" / ".git").read_text() == "gitdir: ./.bare\n"
 
             # Assert: git clone --bare was called
             subprocess_calls = [c for c in mock_subprocess_run.call_args_list]
@@ -484,6 +485,64 @@ class TestCloneWorkflow:
 
 class TestAddCommand:
     """Tests for the add command."""
+
+    @staticmethod
+    def make_bare_layout_with_origin(tmp_path: Path) -> Path:
+        """Real origin plus a bare-layout clone with a main/ worktree; returns repo root."""
+        def git(*args: str, cwd: Path) -> None:
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                            "-c", "init.defaultBranch=main", *args],
+                           cwd=cwd, check=True, capture_output=True)
+        origin = tmp_path / "origin.git"
+        origin.mkdir()
+        git("init", "--bare", cwd=origin)
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        git("init", cwd=seed)
+        git("commit", "--allow-empty", "-m", "base", cwd=seed)
+        git("push", str(origin), "main", cwd=seed)
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        bare_dir = repo_root / ".bare"
+        git("clone", "--bare", str(origin), str(bare_dir), cwd=tmp_path)
+        git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*", cwd=bare_dir)
+        git("fetch", "origin", cwd=bare_dir)
+        git("worktree", "add", str(repo_root / "main"), "main", cwd=bare_dir)
+        return repo_root
+
+    def test_add_checks_out_existing_local_only_branch(self, tmp_path: Path, monkeypatch) -> None:
+        """A branch that exists only locally is attached, not recreated, and not pushed with -L."""
+        repo_root = self.make_bare_layout_with_origin(tmp_path)
+        bare_dir = repo_root / ".bare"
+        subprocess.run(["git", "branch", "feature", "main"], cwd=bare_dir, check=True)
+        monkeypatch.chdir(repo_root)
+
+        result = run_cli(["add", "feature", "-L"])
+
+        assert result.exit_code == 0, result.output
+        assert "Using existing local branch feature." in result.output
+        head = subprocess.run(["git", "branch", "--show-current"], cwd=repo_root / "feature",
+                              capture_output=True, text=True, check=True)
+        assert head.stdout.strip() == "feature"
+        remote = subprocess.run(["git", "ls-remote", "--heads", "origin", "feature"], cwd=bare_dir,
+                                capture_output=True, text=True, check=True)
+        assert remote.stdout == ""
+
+    def test_add_existing_local_branch_tracks_its_remote(self, tmp_path: Path, monkeypatch) -> None:
+        """A local branch also on origin, without an upstream, gets origin/<branch> as upstream."""
+        repo_root = self.make_bare_layout_with_origin(tmp_path)
+        bare_dir = repo_root / ".bare"
+        subprocess.run(["git", "branch", "feature", "main"], cwd=bare_dir, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=bare_dir, check=True,
+                       capture_output=True)
+        monkeypatch.chdir(repo_root)
+
+        result = run_cli(["add", "feature"])
+
+        assert result.exit_code == 0, result.output
+        upstream = subprocess.run(["git", "rev-parse", "--abbrev-ref", "feature@{upstream}"],
+                                  cwd=bare_dir, capture_output=True, text=True, check=True)
+        assert upstream.stdout.strip() == "origin/feature"
 
     def test_add_uses_explicit_branch_name_with_custom_folder(self, tmp_path: Path) -> None:
         """Add should allow the worktree folder to differ from the branch name."""
@@ -2365,8 +2424,9 @@ class TestInitCommand:
         assert 'setup-script = "setup-worktree.sh"' in (tmp_path / "worktree-config.toml").read_text()
 
     def test_init_reports_nothing_to_do(self, tmp_path: Path, monkeypatch) -> None:
-        """init is a no-op when the config already exists."""
+        """init is a no-op when the config and root .git pointer already exist."""
         (tmp_path / ".bare").mkdir()
+        (tmp_path / ".git").write_text("gitdir: ./.bare\n")
         (tmp_path / "worktree-config.toml").write_text('branch-prefix = "billw"\n')
         monkeypatch.chdir(tmp_path)
 
@@ -2375,6 +2435,32 @@ class TestInitCommand:
 
         assert result.exit_code == 0
         assert "Nothing to do: worktree-config.toml already exists." in result.output
+
+    def test_init_adds_missing_root_git_pointer(self, tmp_path: Path, monkeypatch) -> None:
+        """An older bare layout without a root .git gains one on init."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / "worktree-config.toml").write_text('branch-prefix = "billw"\n')
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0
+        assert (tmp_path / ".git").read_text() == "gitdir: ./.bare\n"
+        assert "Created .git pointing at .bare/." in result.output
+        assert "Nothing to do" not in result.output
+
+    def test_init_leaves_existing_root_git_alone(self, tmp_path: Path, monkeypatch) -> None:
+        """A root .git that is already there is never rewritten."""
+        (tmp_path / ".bare").mkdir()
+        (tmp_path / ".git").write_text("gitdir: /elsewhere\n")
+        (tmp_path / "worktree-config.toml").write_text("")
+        monkeypatch.chdir(tmp_path)
+
+        with patch("gh_wt.run_git", return_value=""):
+            run_cli(["init"])
+
+        assert (tmp_path / ".git").read_text() == "gitdir: /elsewhere\n"
 
     def test_init_errors_outside_git(self, tmp_path: Path, monkeypatch) -> None:
         """init outside any git repository fails."""
@@ -2413,10 +2499,60 @@ class TestInitConversion:
         assert result.exit_code == 0
         assert "Converted to bare worktree layout." in result.output
         assert (repo_root / ".bare").is_dir()
-        assert not (repo_root / ".git").exists()
+        assert (repo_root / ".git").read_text() == "gitdir: ./.bare\n"
         assert (repo_root / "main" / "file.txt").read_text() == "hello\n"
+        root_git = subprocess.run(["git", "rev-parse", "--is-bare-repository"], cwd=repo_root,
+                                  capture_output=True, text=True, check=True)
+        assert root_git.stdout.strip() == "true"
         assert (repo_root / "worktree-setup.sh").is_file()
         assert 'setup-script = "worktree-setup.sh"' in (repo_root / "worktree-config.toml").read_text()
+
+    def test_conversion_keeps_ignored_files(self, tmp_path: Path, monkeypatch) -> None:
+        """Ignored files and folders, nested or not, move into the new worktree."""
+        repo_root = tmp_path / "myrepo"
+        make_normal_clone(repo_root)
+        (repo_root / ".gitignore").write_text(".env\nlocal/\nsub/build/\n")
+        (repo_root / "sub").mkdir()
+        (repo_root / "sub" / "tracked.txt").write_text("t\n")
+        subprocess.run(["git", "-C", str(repo_root), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_root), "commit", "-m", "ignore"], check=True, capture_output=True)
+        (repo_root / ".env").write_text("SECRET=1\n")
+        (repo_root / "local" / "deep").mkdir(parents=True)
+        (repo_root / "local" / "deep" / "record.json").write_text("{}\n")
+        (repo_root / "sub" / "build").mkdir()
+        (repo_root / "sub" / "build" / "out.bin").write_text("bin\n")
+        monkeypatch.chdir(repo_root)
+
+        with patch("builtins.input", side_effect=["y", ""]):
+            result = run_cli(["init"])
+
+        assert result.exit_code == 0, result.output
+        main = repo_root / "main"
+        assert (main / ".env").read_text() == "SECRET=1\n"
+        assert (main / "local" / "deep" / "record.json").read_text() == "{}\n"
+        assert (main / "sub" / "build" / "out.bin").read_text() == "bin\n"
+        assert (main / "sub" / "tracked.txt").read_text() == "t\n"
+        assert "Moved 3 ignored path(s) into main/." in result.output
+        assert not (repo_root / ".gh-wt-ignored").exists()
+        status = subprocess.run(["git", "-C", str(main), "status", "--porcelain"],
+                                capture_output=True, text=True, check=True)
+        assert status.stdout == ""
+
+    def test_conversion_refuses_leftover_staging_folder(self, tmp_path: Path, monkeypatch) -> None:
+        """A staging folder from an interrupted run blocks conversion before any change."""
+        repo_root = tmp_path / "myrepo"
+        make_normal_clone(repo_root)
+        (repo_root / ".git" / "info" / "exclude").write_text(".gh-wt-ignored/\n")
+        (repo_root / ".gh-wt-ignored").mkdir()
+        (repo_root / ".gh-wt-ignored" / "keep.txt").write_text("k\n")
+        monkeypatch.chdir(repo_root)
+
+        result = run_cli(["init"])
+
+        assert result.exit_code == 1
+        assert ".gh-wt-ignored/ exists from an earlier conversion" in result.output
+        assert (repo_root / ".git").is_dir()
+        assert (repo_root / ".gh-wt-ignored" / "keep.txt").exists()
 
     def test_conversion_aborts_on_dirty_tree(self, tmp_path: Path, monkeypatch) -> None:
         """Untracked files block conversion; the clone is left untouched."""

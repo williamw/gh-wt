@@ -1214,6 +1214,7 @@ def cmd_clone(args):
         sys.exit(1)
 
     ensure_remote_tracking_refspec(bare_dir)
+    ensure_root_git_pointer(repo_root)
 
     # Get default branch
     default_branch = get_default_branch_name(repo_root)
@@ -1247,14 +1248,33 @@ def confirm(prompt: str, default: bool = False) -> bool:
     return reply in ("y", "yes")
 
 
+ROOT_GIT_POINTER = "gitdir: ./.bare\n"
+
+
+def ensure_root_git_pointer(repo_root: Path) -> bool:
+    """Write a root .git file pointing at .bare/ so git works from the repo root.
+
+    Returns True when the file was created. An existing .git is left alone.
+    """
+    git_entry = repo_root / ".git"
+    if git_entry.exists() or git_entry.is_symlink():
+        return False
+    git_entry.write_text(ROOT_GIT_POINTER)
+    return True
+
+
 def init_bare_layout(repo_root: Path) -> None:
     """Adopt an existing bare-layout repo: fix the refspec, scaffold config, migrate the old script name."""
     refspec_added = ensure_remote_tracking_refspec(repo_root / ".bare")
     if refspec_added:
         print("Configured remote fetch refspec and fetched origin.")
 
+    pointer_added = ensure_root_git_pointer(repo_root)
+    if pointer_added:
+        print("Created .git pointing at .bare/.")
+
     if (repo_root / CONFIG_FILE_NAME).is_file():
-        if not refspec_added:
+        if not refspec_added and not pointer_added:
             print(f"Nothing to do: {CONFIG_FILE_NAME} already exists.")
         return
 
@@ -1275,11 +1295,60 @@ def init_bare_layout(repo_root: Path) -> None:
     print(f"Created {config_path}")
 
 
+IGNORED_STAGING_DIR = ".gh-wt-ignored"
+
+
+def list_ignored_paths(repo_root: Path) -> list[str]:
+    """Return ignored paths relative to the root; wholly ignored folders are one entry."""
+    output = run_git(["status", "--porcelain", "-z", "--ignored"], cwd=str(repo_root), check=False)
+    return [
+        entry[3:].rstrip("/")
+        for entry in output.split("\0")
+        if entry.startswith("!! ")
+    ]
+
+
+def stage_ignored_paths(repo_root: Path, paths: list[str]) -> Path:
+    """Move ignored paths under a staging folder at the root, keeping their layout.
+
+    The old checkout is deleted next, and git status does not count ignored files
+    as dirty, so this is what keeps local data such as .env files and build
+    output. Files stay on the same filesystem, so moves are renames.
+    """
+    staging = repo_root / IGNORED_STAGING_DIR
+    for relative in paths:
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        (repo_root / relative).rename(destination)
+    return staging
+
+
+def restore_ignored_paths(staging: Path, paths: list[str], worktree_path: Path) -> list[str]:
+    """Move staged ignored paths into the new worktree; return any left behind."""
+    left_behind = []
+    for relative in paths:
+        source = staging / relative
+        target = worktree_path / relative
+        if target.exists() or target.is_symlink():
+            left_behind.append(relative)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(target)
+    # Drop the now-empty folders the staging layout created.
+    for folder in sorted((p for p in staging.rglob("*") if p.is_dir()), reverse=True):
+        if not any(folder.iterdir()):
+            folder.rmdir()
+    if not any(staging.iterdir()):
+        staging.rmdir()
+    return left_behind
+
+
 def remove_checked_out_files(repo_root: Path) -> None:
-    """Delete the old checked-out files; safe because the tree was verified clean."""
+    """Delete the old checked-out files; safe because the tree was verified clean
+    and ignored paths were staged first."""
     import shutil
     for entry in repo_root.iterdir():
-        if entry.name == ".bare":
+        if entry.name in (".bare", IGNORED_STAGING_DIR):
             continue
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
@@ -1308,18 +1377,41 @@ def convert_normal_clone(repo_root: Path) -> None:
         sys.exit(1)
 
     folder_name = branch.split("/")[-1]
+    if (repo_root / IGNORED_STAGING_DIR).exists():
+        print(
+            f"Error: {IGNORED_STAGING_DIR}/ exists from an earlier conversion. "
+            "Move its contents back or delete it, then re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if not confirm(f"Convert this clone to the bare worktree layout (.bare/ + {folder_name}/ worktree)? [y/N] "):
         return
+
+    ignored = list_ignored_paths(repo_root)
+    staging = stage_ignored_paths(repo_root, ignored)
 
     bare_dir = repo_root / ".bare"
     (repo_root / ".git").rename(bare_dir)
     run_git(["config", "core.bare", "true"], cwd=str(bare_dir))
     ensure_remote_tracking_refspec(bare_dir)
     remove_checked_out_files(repo_root)
-    run_git(["worktree", "add", str(repo_root / folder_name), branch], cwd=str(bare_dir))
+    worktree_path = repo_root / folder_name
+    run_git(["worktree", "add", str(worktree_path), branch], cwd=str(bare_dir))
+    ensure_root_git_pointer(repo_root)
 
     print("Converted to bare worktree layout.")
-    print(f"Created {repo_root / folder_name}")
+    print(f"Created {worktree_path}")
+
+    if ignored:
+        left_behind = restore_ignored_paths(staging, ignored, worktree_path)
+        moved = len(ignored) - len(left_behind)
+        print(f"Moved {moved} ignored path(s) into {folder_name}/.")
+        if left_behind:
+            print(
+                f"Warning: {len(left_behind)} ignored path(s) already exist in {folder_name}/ "
+                f"and were left in {IGNORED_STAGING_DIR}/: {', '.join(left_behind)}",
+                file=sys.stderr,
+            )
 
     script_path = write_setup_worktree_script(repo_root)
     print(f"Created {script_path}")
@@ -1417,7 +1509,23 @@ def cmd_add(args):
         print(f"Error: Folder already exists: {folder_name}", file=sys.stderr)
         sys.exit(1)
 
-    if remote_exists:
+    if local_branch_exists(bare_dir, checkout_branch):
+        # `worktree add -b` refuses an existing branch, so check it out as-is.
+        print(f"Using existing local branch {checkout_branch}.")
+        run_git(["worktree", "add", str(worktree_path), checkout_branch], cwd=str(bare_dir))
+        upstream = run_git(
+            ["rev-parse", "--abbrev-ref", f"{checkout_branch}@{{upstream}}"],
+            cwd=str(bare_dir),
+            check=False,
+        )
+        if not upstream and remote_exists:
+            run_git(
+                ["branch", f"--set-upstream-to=origin/{checkout_branch}", checkout_branch],
+                cwd=str(bare_dir),
+            )
+        elif not upstream and not local:
+            run_git(["push", "-u", "origin", checkout_branch], cwd=str(worktree_path))
+    elif remote_exists:
         if local:
             print(f"Error: Branch '{checkout_branch}' already exists on origin. Cannot use --local with an existing remote branch.", file=sys.stderr)
             sys.exit(1)

@@ -3,11 +3,13 @@
 GitHub CLI extension for managing repositories that use a bare-git worktree layout.
 
 `gh wt` keeps one bare repository in `.bare/` and checks branches out as sibling
-worktree directories:
+worktree directories. A `.git` file at the root points at `.bare/`, so git
+commands such as `git worktree list` and `git fetch` work from the repo root:
 
 ```text
 repo/
 ├── .bare/
+├── .git          # file: "gitdir: ./.bare", so git works from repo/
 ├── main/
 ├── feature-a/
 └── feature-b/
@@ -52,20 +54,30 @@ file, or a plain clone you want converted to the worktree layout:
 gh wt init
 ```
 
-In a bare-layout repo, `init` fixes the fetch refspec if it is missing and
-scaffolds `worktree-config.toml`, asking for an optional branch prefix
+In a bare-layout repo, `init` fixes the fetch refspec if it is missing, adds
+the root `.git` pointer if it is missing, and scaffolds `worktree-config.toml`, asking for an optional branch prefix
 (Enter for none). If it finds the legacy `setup-worktree.sh`, it offers to
 rename it to `worktree-setup.sh`; either way the config records the name in
 use. In a normal clone, `init` offers to convert it in place:
 `.git/` becomes `.bare/`, the checked-out branch moves into its own worktree
 folder, and local branches, stashes, and reflog all survive. Conversion
-requires a fully clean tree (no modified, staged, or untracked files).
+requires a fully clean tree (no modified, staged, or untracked files). Ignored
+files and folders, such as `.env` files, build output, or private local
+records, are moved into the new worktree at the same paths. They pass through
+a temporary `.gh-wt-ignored/` folder at the root; if a conversion is
+interrupted, your files are there, and `init` refuses to run again until that
+folder is emptied or removed.
 
 Add a worktree for a branch:
 
 ```bash
 gh wt add feature-branch
 ```
+
+If the branch already exists locally, for example one left behind by a
+conversion, `add` checks it out as-is instead of creating it. It sets the
+upstream to `origin/<branch>` when that exists and none is configured, and
+pushes a local-only branch with `-u` unless `--local` is given.
 
 Branch names with slashes keep the branch name intact and use the final path
 segment as the folder name:

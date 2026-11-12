@@ -87,6 +87,19 @@ gh wt --help
   converts in place (`.git` → `.bare`) after requiring a fully clean tree, so
   local branches, stashes, and reflog survive. Prompts (`confirm`) live only in
   `init` — `add` must stay non-interactive.
+- **Conversion keeps ignored files:** `git status --porcelain` does not list
+  ignored files, yet `remove_checked_out_files` deletes everything at the root.
+  `convert_normal_clone` stages `git status --ignored` paths in
+  `.gh-wt-ignored/` before the deletion and moves them into the new worktree
+  afterwards. A leftover staging folder means an interrupted run, so `init`
+  refuses rather than guessing.
+- **Root `.git` pointer:** `clone`, conversion, and `init` write
+  `gitdir: ./.bare` at the repo root (never overwriting an existing `.git`).
+  Discovery from a stack container then finds a bare repo, so
+  `rev-parse --show-toplevel` still fails there as `find_stack_host` expects.
+- **`add` attaches existing local branches:** `worktree add -b` refuses a branch
+  that exists, so `add` checks it out directly, adopting `origin/<branch>` as
+  upstream when unset, or pushing with `-u` unless `--local`.
 - **Fetch refspec is managed:** `git clone --bare` writes no fetch refspec, so
   remote-tracking refs never update. `ensure_remote_tracking_refspec` installs
   `+refs/heads/*:refs/remotes/origin/*` in `clone` and `init`; remote-branch
