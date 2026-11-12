@@ -1882,10 +1882,13 @@ def get_worktree_branches(repo_root: Path) -> list[tuple[str, str, str]]:
 def is_branch_safe_to_delete(branch: str, bare_dir: str) -> bool:
     """Check if a branch is safe to delete (no unpushed commits).
 
-    A branch is safe if:
-    - Local branch exists
-    - Origin branch exists
-    - Local commit is equal to or behind origin commit (no unpushed work)
+    A branch is safe when its local commit already exists on origin, either:
+    - on origin/<branch> (local is equal to or behind its remote), or
+    - on origin/<trunk>, which covers branches merged by fast-forward or
+      created with --local and never pushed under their own name.
+
+    Uses the remote-tracking refs as last fetched; a stale trunk ref can only
+    make a branch look unsafe, never safe.
 
     Args:
         branch: Branch name to check
@@ -1904,29 +1907,25 @@ def is_branch_safe_to_delete(branch: str, bare_dir: str) -> bool:
         if not local_commit:
             return False
 
-        # Get origin branch commit
-        origin_commit = run_git(
-            ["rev-parse", f"origin/{branch}"],
-            cwd=bare_dir,
-            check=False
-        )
-        if not origin_commit:
+        if is_commit_on_remote_ref(branch, local_commit, f"origin/{branch}", bare_dir):
+            return True
+
+        trunk = get_default_branch_name(Path(bare_dir).parent)
+        if trunk == branch:
             return False
-
-        # Check if local is ancestor of or equal to origin
-        # (meaning local has nothing origin doesn't have)
-        merge_base = run_git(
-            ["merge-base", branch, f"origin/{branch}"],
-            cwd=bare_dir,
-            check=False
-        )
-
-        # Safe if: local == origin, or local is behind origin
-        # This is true when merge-base equals local commit
-        return merge_base == local_commit
+        return is_commit_on_remote_ref(branch, local_commit, f"origin/{trunk}", bare_dir)
 
     except Exception:
         return False
+
+
+def is_commit_on_remote_ref(branch: str, local_commit: str, remote_ref: str, bare_dir: str) -> bool:
+    """Return whether the branch's commit is contained in remote_ref."""
+    if not run_git(["rev-parse", remote_ref], cwd=bare_dir, check=False):
+        return False
+    # The merge-base equals the local commit when origin already has all of it.
+    merge_base = run_git(["merge-base", branch, remote_ref], cwd=bare_dir, check=False)
+    return merge_base == local_commit
 
 
 def print_stack_layers(folder_name: str, status_msg: str, view: dict, number: Optional[int]) -> bool:

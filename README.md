@@ -182,8 +182,12 @@ Remove all worktrees whose associated pull requests are merged or closed:
 gh wt rm --merged
 ```
 
-Use `--force` to bypass the local branch safety check when you know you want to
-delete a worktree with unpushed or untracked work.
+The local branch safety check passes when origin already has the branch's
+commits, either on `origin/<branch>` or on the default branch (`origin/main`).
+A branch made with `gh wt add -L` and fast-forwarded into `main` can therefore be
+removed once `main` is pushed and fetched, without `--force`. Use `--force` to
+bypass the check when you know you want to delete a worktree with unpushed or
+untracked work.
 
 If Git refuses to remove a worktree because it contains submodules, `gh wt rm`
 deinitializes submodules in that worktree and retries with `--force` before

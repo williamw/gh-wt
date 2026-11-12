@@ -1040,20 +1040,102 @@ class TestIsBranchSafeToDelete:
 
         assert result is False
 
-    def test_unsafe_when_no_origin_branch(self, tmp_path: Path) -> None:
-        """Branch is unsafe when no origin branch exists."""
+    @staticmethod
+    def fake_git(refs: dict[str, str], merge_bases: dict[str, str]):
+        """Answer rev-parse/merge-base by ref name; anything else returns ''."""
+        def run(args: list[str], cwd=None, check=True) -> str:
+            if args[0] == "rev-parse":
+                return refs.get(args[1], "")
+            if args[0] == "merge-base":
+                return merge_bases.get(args[2], "")
+            if args[:2] == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
+                return "origin/main"
+            return ""
+        return run
+
+    def test_unsafe_when_no_origin_branch_and_not_on_trunk(self, tmp_path: Path) -> None:
+        """A local-only branch with commits trunk lacks is unsafe."""
         from gh_wt import is_branch_safe_to_delete
         bare_dir = tmp_path / ".bare"
         bare_dir.mkdir()
+        fake = self.fake_git(
+            refs={"feature": "abc123", "origin/main": "def456"},
+            merge_bases={"origin/main": "000111"},
+        )
+        with patch("gh_wt.run_git", side_effect=fake):
+            assert is_branch_safe_to_delete("feature", str(bare_dir)) is False
 
-        with patch("gh_wt.run_git") as mock_run_git:
-            mock_run_git.side_effect = [
-                "abc123",  # local exists
-                "",        # origin branch doesn't exist
-            ]
-            result = is_branch_safe_to_delete("feature", str(bare_dir))
+    def test_safe_when_local_only_branch_is_on_trunk(self, tmp_path: Path) -> None:
+        """A branch never pushed under its own name is safe once trunk contains it."""
+        from gh_wt import is_branch_safe_to_delete
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        fake = self.fake_git(
+            refs={"feature": "abc123", "origin/main": "def456"},
+            merge_bases={"origin/main": "abc123"},
+        )
+        with patch("gh_wt.run_git", side_effect=fake):
+            assert is_branch_safe_to_delete("feature", str(bare_dir)) is True
 
-        assert result is False
+    def test_safe_when_ahead_of_own_remote_but_on_trunk(self, tmp_path: Path) -> None:
+        """Commits added after the last branch push are fine once trunk has them."""
+        from gh_wt import is_branch_safe_to_delete
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        fake = self.fake_git(
+            refs={"feature": "abc123", "origin/feature": "999888", "origin/main": "def456"},
+            merge_bases={"origin/feature": "999888", "origin/main": "abc123"},
+        )
+        with patch("gh_wt.run_git", side_effect=fake):
+            assert is_branch_safe_to_delete("feature", str(bare_dir)) is True
+
+    def test_trunk_is_not_checked_against_itself(self, tmp_path: Path) -> None:
+        """Local trunk ahead of origin/trunk stays unsafe."""
+        from gh_wt import is_branch_safe_to_delete
+        bare_dir = tmp_path / ".bare"
+        bare_dir.mkdir()
+        fake = self.fake_git(
+            refs={"main": "abc123", "origin/main": "def456"},
+            merge_bases={"origin/main": "def456"},
+        )
+        with patch("gh_wt.run_git", side_effect=fake):
+            assert is_branch_safe_to_delete("main", str(bare_dir)) is False
+
+    def test_local_only_branch_merged_into_trunk_with_real_git(self, tmp_path: Path) -> None:
+        """End to end: a --local branch fast-forwarded into main and pushed is safe."""
+        from gh_wt import is_branch_safe_to_delete
+
+        def git(*args: str, cwd: Path) -> None:
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                            "-c", "init.defaultBranch=main", *args],
+                           cwd=cwd, check=True, capture_output=True)
+
+        origin = tmp_path / "origin.git"
+        origin.mkdir()
+        git("init", "--bare", cwd=origin)
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        git("init", cwd=seed)
+        git("commit", "--allow-empty", "-m", "base", cwd=seed)
+        git("push", str(origin), "main", cwd=seed)
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        bare_dir = repo_root / ".bare"
+        git("clone", "--bare", str(origin), str(bare_dir), cwd=tmp_path)
+        git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*", cwd=bare_dir)
+        git("fetch", "origin", cwd=bare_dir)
+        git("worktree", "add", str(repo_root / "main"), "main", cwd=bare_dir)
+        git("worktree", "add", "-b", "feature", str(repo_root / "feature"), "main", cwd=bare_dir)
+        git("commit", "--allow-empty", "-m", "work", cwd=repo_root / "feature")
+
+        assert is_branch_safe_to_delete("feature", str(bare_dir)) is False
+
+        git("merge", "--ff-only", "feature", cwd=repo_root / "main")
+        git("push", "origin", "main", cwd=repo_root / "main")
+        git("fetch", "origin", cwd=bare_dir)
+
+        assert is_branch_safe_to_delete("feature", str(bare_dir)) is True
 
     def test_unsafe_when_local_branch_missing(self, tmp_path: Path) -> None:
         """Branch is unsafe when local branch doesn't exist."""

@@ -99,6 +99,10 @@ gh wt --help
 - **Remove resolves the real branch:** `rm <folder>` inspects the worktree's
   checked-out branch before safety checks, branch deletion, and optional remote
   deletion.
+- **Safe deletion accepts trunk:** `is_branch_safe_to_delete` treats a branch
+  as pushed when its commit is on `origin/<branch>` or on `origin/<trunk>`, so
+  `--local` branches merged by fast-forward need no `--force`. It reads the
+  last-fetched refs; a stale trunk ref can only refuse, never allow.
 - **Submodule-aware removal:** `remove_worktree()` retries with submodule
   deinitialization and `git worktree remove --force` only when Git reports that
   submodules block removal.
