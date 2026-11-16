@@ -201,6 +201,11 @@ removed once `main` is pushed and fetched, without `--force`. Use `--force` to
 bypass the check when you know you want to delete a worktree with unpushed or
 untracked work.
 
+`--dry-run` previews the actual eligible targets for both single-folder and
+`--merged` removal. `--keep-branch` retains the local branch and skips its
+unpushed-commit check. Local and ignored files are protected unless `--force`
+is given.
+
 If Git refuses to remove a worktree because it contains submodules, `gh wt rm`
 deinitializes submodules in that worktree and retries with `--force` before
 deleting the branch.
@@ -224,156 +229,106 @@ gh wt list
 
 ## Stacked PRs
 
-`gh wt stack` turns the worktree you are standing in into a stack of pull
-requests, with one folder per layer so several people or agents can work
-different layers at the same time. It is a converter, not a creator: start work
-normally, and convert when the change outgrows one review.
+Use `gh stack >=0.3.0` for membership, history, PRs, merging and recovery.
+`gh wt` creates independent worktrees, runs setup hooks and shows their actual
+paths. Branches and folder aliases stay independent; existing nested worktrees
+stay where they are.
+
+Adopt existing PRs by full URL without pushing their branches:
 
 ```bash
-gh wt add some-feature
-cd some-feature
-# ...work grows too large for one PR...
-gh wt stack base
-```
-
-Conversion renames the branch to `billw/some-feature/01-base`, moves the
-worktree to `some-feature/01-base/`, and turns `some-feature/` into a plain
-container folder holding the layers. The name argument is optional: without it
-layer 1 is just `01`, and `gh wt stack rename 01 01-base` renames it later.
-Conversion also enables `git rerere` in the shared `.bare/config`, which
-`gh stack init` does not do despite its README.
-
-Add layers, each in its own worktree:
-
-```bash
-cd 01-base
-gh wt stack add api      # -> some-feature/02-api, billw/some-feature/02-api
-gh wt stack add ui       # -> some-feature/03-ui,  billw/some-feature/03-ui
-```
-
-Each new layer is pushed to origin with an upstream, like `gh wt add`; pass
-`-L`/`--local` to keep it local until `gh stack submit`. The number is added
-for you; `gh wt stack add 02-api` also works, but a number that is not the next
-layer's is refused. `add`, `rename`, `rebase`, and `agent` are reserved words,
-so they cannot name layer 1. The older flag spellings
-(`--add`, `--rename`, `--rebase`, `--agent`) still work.
-
-```text
-some-feature/
-├── 01-base/   billw/some-feature/01-base
-├── 02-api/    billw/some-feature/02-api
-└── 03-ui/     billw/some-feature/03-ui
-```
-
-**Folder and branch always spell the same thing.** The branch path under the
-prefix is the folder path, which is why conversion has to rename layer 1: a ref
-cannot be both a leaf and a directory, so `billw/some-feature` existing would
-block `billw/some-feature/02-api` from ever being created.
-
-**Renaming layer 1 closes an open PR on it.** GitHub closes any pull request
-whose head branch is renamed. `gh wt stack` prompts before doing it, and a run
-whose output is captured — an agent, a script — fails instead, so `--force` is
-required to go ahead. `gh wt stack rename` is gated the same way.
-
-**The bottom layer is the host.** Its worktree holds `gh stack`'s metadata,
-so it has to stay on layer 1's branch: `gh stack view` fails on a detached
-HEAD. It is also the one layer gh-wt never detaches. `gh stack add` only works
-at the top of a stack, so `gh wt stack add` briefly detaches the layer
-worktrees above, climbs, adds, and puts them back. Uncommitted work in those
-folders is preserved.
-
-**Run `gh stack` commands from the bottom layer's folder.** It is the only
-worktree carrying the metadata, so `gh stack view`, `push`, `submit`, `merge`,
-and `sync` report "not part of a stack" anywhere else. The `gh wt stack`
-subcommands find the host themselves and work from any layer folder or from
-the container.
-
-**Move between layers with `cd`**, e.g. `cd ../02-api`. Never use
-`gh stack up`, `down`, `switch`, `top`, or `bottom`: they check a layer out in
-the current worktree, and every other layer is already checked out in its own.
-
-**Cascade with `gh wt stack rebase`, never `gh stack rebase`.** The latter
-checks each layer out in turn and dies on any branch another worktree holds,
-then rolls the whole cascade back. `gh wt stack rebase` detaches every layer
-worktree first and restores it afterwards:
-
-```bash
-gh wt stack rebase             # pull trunk and rebase every layer
-gh wt stack rebase --no-trunk  # cascade a lower-layer fix without pulling trunk
-```
-
-Every agent must be idle and committed when it runs. On a conflict the layers
-are left detached and the message points you at the host folder; resolve there
-and run `gh wt stack rebase --continue`.
-
-`gh wt stack` refuses to run on the trunk worktree, on a detached HEAD, on a
-worktree that already hosts a stack, and when the `gh stack` extension is
-missing. Install it with `gh extension install github/gh-stack`.
-
-If the adopted branch is still too large for one review (more than 3 commits
-or 500 changed lines), `gh wt stack` says so. When its output is being captured
-rather than shown in a terminal — as when an AI agent runs it — it also prints
-a short block pointing at `gh wt stack agent`, which prints the full
-layer-splitting procedure. Run `gh wt stack agent` yourself to see exactly
-what agents are told.
-
-`gh wt status` renders a stack once, under its container, rather than once per
-layer worktree:
-
-```text
-some-feature
-  Stack: #2331 - 3 layers
-  Status: Clean
-  Layers:
-    1  billw/some-feature/01-base  #2326 (OPEN)
-    2  billw/some-feature/02-api   #2327 (OPEN)
-    3  billw/some-feature/03-ui    #2328 (OPEN)
-```
-
-A layer needing a rebase is flagged and makes `status` exit non-zero. If
-`gh stack view` is unavailable, `status` falls back to the ordinary
-single-branch display.
-
-`gh wt rm` treats a stack as all-or-nothing. Remove it by its container name:
-
-```bash
-gh wt rm some-feature
-```
-
-Removing a single layer is refused, because deleting one layer's branch out of
-a live stack strands the rest. `gh wt rm --merged` removes a stack only when
-every layer's PR is merged or closed, and never sweeps layers one at a time as
-their individual PRs land.
-
-Known limitation: `gh stack trunk` and `gh stack checkout <trunk>` cannot work
-in this layout, because trunk is already checked out in its own worktree.
-
-A stack from start to finish:
-
-```bash
-gh wt add MCL-123-feature && cd MCL-123-feature
-# ...work grows too large for one PR...
-gh wt stack docs                     # -> MCL-123-feature/01-docs/
-cd 01-docs && gh wt stack add api    # -> ../02-api/, pushed
-
-# fix something in 01-docs and commit it, then cascade it upward:
-gh wt stack rebase --no-trunk && gh stack push
-gh stack submit --auto --open        # open every layer's PR, linked as a stack
-
-# later, trunk moved:
-gh wt stack rebase && gh stack push
-
-# after review:
-gh stack merge
-gh wt rm MCL-123-feature
-```
-
-
-Show status for all worktrees:
-
-```bash
+gh stack link --base main --open https://github.com/owner/repo/pull/123 https://github.com/owner/repo/pull/124
+gh stack checkout <stack>
+gh wt stack setup --dry-run
+gh wt stack setup
 gh wt status
 ```
+
+Use full PR URLs for this flow. In gh stack 0.3.0, a numeric argument is first
+checked as a local branch name; if that branch exists, `link` treats it as a
+branch and may push it instead of looking up the PR number.
+
+For local branches, use `gh stack init --base main <bottom> <next> ...`
+to establish the stack first. Run setup from a branch belonging to that tracked
+stack. When trunk belongs to several stacks, enter a member worktree so native
+JSON discovery can resolve the intended stack.
+
+`gh wt stack setup` reuses every registered owner at its actual path, preserving
+its HEAD and local files. Missing branches receive normal sibling worktrees,
+using the branch's final path segment as the default folder. A folder collision
+stops setup before any worktree is created. Resolve it with an alias, then retry:
+
+```bash
+gh wt add api-review -b user/api -L
+gh wt stack setup
+```
+
+Setup runs the normal configured hook only for new worktrees, never pushes, and
+can be repeated. `--dry-run` creates no directories or refs and runs no hooks.
+If a hook fails, the created worktree and branch remain; inspect them and rerun
+the hook manually. Repeating setup reuses that worktree without rerunning its hook.
+
+Add a new top layer from any member worktree:
+
+```bash
+gh wt stack add api
+gh wt stack add ui -L
+```
+
+The normal branch prefix applies to a bare name. For example, with prefix
+`billw`, `api` creates branch `billw/api` in sibling folder `api`. Explicit
+`user/api` keeps that branch and uses folder `api`. Existing branch or folder
+collisions are refused. The branch starts at the top layer, and native `gh stack
+add` adopts it through its actual worktree owner. Existing worktrees never switch
+branches. The new layer alone is pushed with its own upstream unless `-L` is
+specified; the normal setup hook runs once after adoption and any push.
+
+Use the actual paths shown by `gh wt status` to move between distributed layers.
+Native navigation commands may report that another worktree owns the target;
+enter that worktree. Status groups each discovered stack once by trunk and
+ordered membership, with each layer's PR, actual path, dirty state and rebase
+warning. It also shows ordinary worktrees. Missing, ambiguous or unavailable
+stack information is reported explicitly. Native 0.3.0 JSON does not expose a
+stack number, so the heading identifies the stack by bottom branch and trunk.
+
+Coordinate affected agents before native history changes:
+
+```bash
+gh stack rebase --upstack --no-trunk  # cascade layers above the current fix
+gh stack push
+gh stack submit --auto --open
+```
+
+`--upstack` limits the cascade to layers above the current branch. `--no-trunk`
+alone skips fetching and rebasing with trunk but still rebases all stack layers
+onto each other, regardless of the current layer. Read `gh stack rebase --help`
+for whole-stack/trunk modes. Native rebase owns
+distributed-worktree coordination and conflict recovery; resolve in the worktree
+it reports and use `gh stack rebase --continue` or `--abort`. Check
+`git config --get rerere.enabled` rather than assuming its value. `gh stack sync`
+can change refs and prune merged branches; review its flags before running it.
+
+After an authorized merge, choose cleanup per worktree and inspect service
+ownership and retained files first:
+
+```bash
+gh wt rm api --keep-branch --dry-run
+gh wt rm api --keep-branch
+gh wt rm --merged --dry-run
+```
+
+`--keep-branch` removes just that worktree, including a live stack member, while
+retaining the local branch. It cannot be combined with `--delete-remote`.
+Without it, active stack branches are protected even with `--force`.
+`--merged` previews or removes eligible individual worktrees; it does not delete
+a stack or container as a unit. Unavailable membership blocks branch deletion
+and points to `--keep-branch` for deliberate worktree-only cleanup. Dirty or
+ignored files still require explicit `--force`.
+
+`gh wt stack` shows help. Conversion, automatic branch renaming, numbered/grouped
+containers, `gh wt stack rename`, wrapper `rebase`, and old hidden flags were
+removed. Use `gh stack init` or `link`, then `gh wt stack setup`.
+`gh wt stack agent` prints static guidance for agents.
 
 ## Requirements
 
@@ -384,22 +339,20 @@ gh wt status
 
 ## Development
 
-Install dependencies:
+Run project tooling in the repository-owned container:
 
 ```bash
-pixi install
+make check
 ```
 
-Run tests:
+The Makefile uses the same Pixi-backed environment as `.devcontainer/`, with
+source in this checkout and dependency caches in container storage. Do not
+install project dependencies on the host.
+
+To install a tested checkout as the active extension, only when intended:
 
 ```bash
-pixi run test
-```
-
-Install the local checkout as the active `gh wt` extension:
-
-```bash
-gh extension remove gh-wt 2>/dev/null || true
+gh extension remove gh-wt
 gh extension install .
 gh wt --help
 ```

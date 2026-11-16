@@ -1,237 +1,80 @@
 # gh-wt: Agent Guide
 
-## Overview
-
-`gh-wt` is a GitHub CLI extension for repositories that use a bare-git
-worktree layout. It stores the bare repository in `.bare/` and checks branches
-out as sibling directories.
-
-## Layout
-
-```text
-gh-wt/
-├── gh-wt          # GitHub CLI extension entry point
-├── gh_wt.py       # Main implementation module
-├── test_gh_wt.py  # pytest suite
-├── pixi.toml      # Pixi environment/tasks
-└── README.md      # User-facing docs
-```
+`gh-wt` manages a bare repository in `.bare/` with independent worktrees.
+The root `.git` file points at `.bare/`; folder aliases do not identify branches
+or stacks. See README.md for ordinary clone/init/add configuration.
 
 ## Commands
 
 ```bash
 gh wt clone <owner/repo>
 gh wt init
-gh wt add [<branch-or-folder-or-linear-url>] [-B|--base-branch <branch>] [-b|--branch-name <branch>] [-l|--linear <url>] [-L|--local]
+gh wt add <folder-or-branch> [-B <base>] [-b <branch>] [-L]
 gh wt list
 gh wt status
-gh wt rm <folder> [-d|--delete-remote] [-f|--force]
-gh wt rm --merged [-d|--delete-remote] [-f|--force]
-gh wt stack [NAME] [-f|--force]
-gh wt stack add NAME [-L|--local]
-gh wt stack rename OLD NEW [-f|--force]
-gh wt stack rebase [--no-trunk | --continue]
+gh wt rm <folder> [--keep-branch] [--dry-run] [-d] [-f]
+gh wt rm --merged [--keep-branch] [--dry-run] [-d] [-f]
+gh wt stack setup [--dry-run]
+gh wt stack add <name> [-L]
 gh wt stack agent
 ```
 
-## Development
+## Native stacks
 
-Install dependencies:
+- Require gh stack >=0.3.0 for stack operations. Use supported
+  `gh stack view --json` for membership and PR state. Never read or write private
+  stack catalog files. Resolve actual owners from Git worktree porcelain output.
+- A shared catalog can contain several stacks. Group status by trunk and ordered
+  membership, never flatten all branches into one stack. Native 0.3.0 JSON has no
+  stack number; identify a stack by its bottom branch and trunk instead.
+- Native gh stack owns membership, rebase, publication, merging and recovery.
+  There is no wrapper rebase journal, detach/restore operation, stack conversion,
+  grouped container creation or branch renaming. Old commands and flags must fail
+  with guidance to gh stack init/link and gh wt stack setup.
+- Setup preflights all destinations, reuses existing owners unchanged, and runs
+  normal hooks only for newly created worktrees. Dry run creates no dirs/refs and
+  runs no hooks. Existing nested worktrees stay in place.
+- Stack add creates a flat worktree for a new branch at the top layer, then uses
+  public native add adoption from the top owner. If the top has no owner, create
+  the new destination on top first and let native add switch only that new
+  worktree. Never move another worktree's HEAD. Push only the new branch with its
+  own upstream unless -L; run its hook after adoption and any push.
+- Preserve dirty/unrelated worktrees, untracked/ignored data and existing HEADs.
+  Refuse busy affected owners and collisions before mutation. On partial setup,
+  native adoption, push or hook failure, name the retained worktree and recovery.
+- Removal targets one registered worktree at a time. --keep-branch retains the
+  local branch, including active stack branches; it conflicts with --delete-remote.
+  Without it, active members cannot be deleted even with --force. Unavailable or
+  ambiguous membership blocks branch deletion. --merged dry run previews real
+  eligible targets and never removes a whole stack/container automatically.
+- Agent-facing guidance stays static: never interpolate remote branch names or
+  PR titles into agent instructions. Diagnostic data must remain diagnostic data.
 
-```bash
-pixi install
-```
+## Ordinary behavior to preserve
 
-Run tests:
+- Subprocess Git commands respect user configuration; Python stdlib only.
+- Config is worktree-config.toml, parsed with tomllib. Prefixes apply to bare
+  names; explicit -b bypasses them. -B selects base; -l selects Linear; -L is local.
+- Hooks receive the folder path relative to repo root. A configured script must
+  be executable; conflicting default names are an error. Hooks run as subprocesses
+  and cannot change the caller's shell directory.
+- init conversion preserves ignored files in .gh-wt-ignored before moving them
+  into the new checkout. Preserve interrupted staging and refuse guessing.
+- clone/init manage the remote fetch refspec and root .git pointer. Fetches prune.
+- rm resolves actual branch refs, supports external registered paths, and
+  preserves branches when stale worktree records are pruned. Submodule and
+  post-removal leftover handling remain in remove_worktree.
+- Branch deletion requires pushed commits or commits present on origin/trunk,
+  unless explicit --force. --keep-branch skips this ref-deletion check while
+  still guarding local/ignored files. Do not broaden force implicitly.
+- Handle a deleted current directory with check_current_dir and removal hints.
 
-```bash
-pixi run test
-```
+## Development and verification
 
-Install this checkout as the local `gh wt` extension:
-
-```bash
-gh extension remove gh-wt 2>/dev/null || true
-gh extension install .
-gh wt --help
-```
-
-## Key Design Decisions
-
-- **Subprocess over a Git library:** direct `git` CLI calls keep dependencies
-  minimal and respect the user's Git config.
-- **Bare repo in `.bare/`:** enables sibling worktree directories such as
-  `repo/main` and `repo/feature-x`.
-- **Branch/folder split:** `gh wt add folder --branch-name user/feature`
-  lets the worktree folder differ from the branch name.
-- **Clone scaffolds the setup hook:** `gh wt clone` writes an executable starter
-  `worktree-setup.sh` (see `SETUP_WORKTREE_TEMPLATE`) into the repo root that
-  validates the worktree folder and leaves a commented slot for project setup.
-  It must not `cd`/`exec` into a subshell — the hook runs as a subprocess, so a
-  bare `cd` cannot change the parent shell, and an `exec`'d shell traps
-  non-interactive callers.
-- **Config file is TOML, not YAML:** `worktree-config.toml` in the repo root is
-  parsed with stdlib `tomllib` (Python 3.11+), keeping the extension free of
-  third-party dependencies. Keys: `branch-prefix`, `setup-script`. Missing file
-  means all behavior is unchanged; invalid TOML is a hard error.
-- **Branch-prefix exemption rules:** the prefix applies only to bare names (no
-  `/`) without `--branch-name`; lookup prefers `origin/<prefix>/<name>` over
-  `origin/<name>` (`resolve_prefixed_branch`), else creates `<prefix>/<name>`.
-  A positional prefix in `--linear` mode beats the config prefix.
-- **Setup-script naming transition:** `worktree-setup.sh` is the current name,
-  `setup-worktree.sh` the legacy one. A configured `setup-script` resolves from
-  the repo root and must be executable (hard error otherwise); without the key,
-  both defaults are tried in the invocation dir and finding both is an error.
-- **`init` migrates and converts:** in a bare layout it fixes the fetch refspec
-  and scaffolds config (offering the script rename); in a normal clone it
-  converts in place (`.git` → `.bare`) after requiring a fully clean tree, so
-  local branches, stashes, and reflog survive. Prompts (`confirm`) live only in
-  `init` — `add` must stay non-interactive.
-- **Conversion keeps ignored files:** `git status --porcelain` does not list
-  ignored files, yet `remove_checked_out_files` deletes everything at the root.
-  `convert_normal_clone` stages `git status --ignored` paths in
-  `.gh-wt-ignored/` before the deletion and moves them into the new worktree
-  afterwards. A leftover staging folder means an interrupted run, so `init`
-  refuses rather than guessing.
-- **Root `.git` pointer:** `clone`, conversion, and `init` write
-  `gitdir: ./.bare` at the repo root (never overwriting an existing `.git`).
-  Discovery from a stack container then finds a bare repo, so
-  `rev-parse --show-toplevel` still fails there as `find_stack_host` expects.
-- **`add` attaches existing local branches:** `worktree add -b` refuses a branch
-  that exists, so `add` checks it out directly, adopting `origin/<branch>` as
-  upstream when unset, or pushing with `-u` unless `--local`.
-- **Fetch refspec is managed:** `git clone --bare` writes no fetch refspec, so
-  remote-tracking refs never update. `ensure_remote_tracking_refspec` installs
-  `+refs/heads/*:refs/remotes/origin/*` in `clone` and `init`; remote-branch
-  detection assumes it.
-- **Base branch naming:** `--base-branch` / `-B` selects the source branch for
-  new worktrees; do not reintroduce the old `--base` option.
-- **Linear owns `-l`:** `--linear` / `-l` names the branch from a Linear issue
-  URL (`parse_linear_issue_url`); `--local` uses `-L`. Do not give `-l` back to
-  `--local`.
-- **Remove resolves the real branch:** `rm <folder>` inspects the worktree's
-  checked-out branch before safety checks, branch deletion, and optional remote
-  deletion.
-- **Safe deletion accepts trunk:** `is_branch_safe_to_delete` treats a branch
-  as pushed when its commit is on `origin/<branch>` or on `origin/<trunk>`, so
-  `--local` branches merged by fast-forward need no `--force`. It reads the
-  last-fetched refs; a stale trunk ref can only refuse, never allow.
-- **Submodule-aware removal:** `remove_worktree()` retries with submodule
-  deinitialization and `git worktree remove --force` only when Git reports that
-  submodules block removal.
-- **Removal returns a bool and cleans up after Git:** Git empties a worktree and
-  then rmdir's the folder, so anything that reappears mid-delete (macOS
-  rewriting `.DS_Store`) fails the command with "Directory not empty" — after
-  Git has already unlinked its own metadata. `remove_worktree()` deletes the
-  leftovers itself and runs `git worktree prune`, then reports success as a
-  bool rather than exiting. `rm --merged` records failures and keeps going so
-  one stuck folder cannot strand the worktrees behind it, exiting non-zero at
-  the end and leaving the failed worktree's branch in place.
-- **One folder per layer:** conversion moves the worktree into a container
-  (`some-feature/` becomes a plain directory holding `01-base/`), so layers can
-  be worked in parallel. Git refuses to move a worktree into its own
-  subdirectory, so `move_worktree_into_container` parks it at a sibling first;
-  an interrupted run is reported by `report_interrupted_move` rather than
-  guessed at.
-- **Folder path equals branch path:** a layer folder and its branch spell the
-  same thing under the prefix. That forces conversion to rename layer 1, since
-  a ref cannot be both a leaf and a directory - `billw/some-feature` existing
-  blocks `billw/some-feature/02-api` from being created at all, locally and on
-  origin.
-- **Renaming layer 1 closes its PR:** GitHub closes any PR whose head branch is
-  renamed, and no API avoids it. `ensure_rename_is_allowed` prompts on a
-  terminal and hard-fails a captured run, so an agent cannot close a PR by
-  omission. `--force` is the only way through.
-- **Fetches prune:** renaming a branch leaves a stale remote-tracking ref that
-  makes the next plain `git fetch` fail with a directory/file conflict, so
-  every fetch gh-wt runs passes `--prune`.
-- **The bottom layer is the host:** its worktree carries gh stack's metadata
-  and is the one layer gh-wt never detaches, because `gh stack view --json`
-  exits 2 on a detached HEAD and `gh wt status` would silently lose the stack.
-  Every raw `gh stack` command therefore has to run from the host's folder.
-- **gh stack only adds at the top:** so `gh wt stack add` detaches the layer
-  worktrees, climbs with `gh stack top`, adds, parks the host back on layer 1,
-  and reattaches. Detaching preserves each working tree exactly, so an agent's
-  uncommitted work survives.
-- **`stack add` pushes like `add`:** the new layer goes to origin with `-u`
-  unless `-L`/`--local`. The worktree already exists by then, so a failed push
-  warns instead of failing; `gh stack submit` pushes it later anyway.
-- **Restoring needs no saved state:** `restore_layer_worktrees` derives each
-  branch from the folder name, which is why `rebase --continue` can pick up
-  in a later process after a conflict.
-- **`gh stack rebase` cannot run directly:** it checks each layer out in the
-  host and fails on any branch another worktree holds. `gh wt stack rebase`
-  wraps it in the release/restore envelope, and leaves the layers detached on
-  conflict rather than taking back a branch the half-finished rebase needs.
-- **Removal guards are filesystem-only:** `find_host_beside` reads sibling
-  directories instead of calling git, because the removal paths run inside
-  tightly mocked `run_git` sequences that a stray call would break.
-- **`rm` never takes one layer:** a layer worktree has no metadata of its own,
-  so the old code deleted its branch as an ordinary worktree - and `rm --merged`
-  would sweep a whole stack layer by layer as each PR landed.
-  `refuse_removing_a_lone_layer` and the container branch in the sweep stop
-  both.
-- **The old single-worktree layout still works:** a host sitting directly at the
-  repo root is pre-container and removes in place, which is why both removal
-  paths compare the container against `repo_root` before treating it as a stack
-  folder.
-- **The `add` guardrail exists because Git does not guard:** Git refuses only
-  the branch a worktree *currently* holds, so `gh wt add <sibling-layer>`
-  succeeds and fails days later mid-rebase. `find_stack_worktree_for_branch`
-  blocks it up front and points at the layer's own folder.
-- **Stack detection is filesystem-only:** `read_stack_metadata` resolves the
-  worktree's git dir from its `.git` pointer file rather than calling
-  `git rev-parse --git-dir`. gh stack stores metadata per-worktree
-  (`.bare/worktrees/<name>/gh-stack`), never in the common dir.
-- **Nested renames go through a sibling:** GitHub's rename API rejects
-  `a` -> `a/01` as "not a valid branch name" (422) while `a` still occupies the
-  path, so `rename_remote_branch` renames to `<old>.gh-wt-rename` first. GitHub
-  keeps serving the old ref for a second or two after the rename returns, so
-  it polls (`wait_for_remote_branch_to_go`) before the second step.
-- **Renames repoint the upstream in config:** `git branch -m` carries the old
-  `branch.<name>.merge` over verbatim, leaving the layer tracking a remote
-  branch that no longer exists. `rename_stack_branch` writes the new one
-  directly rather than using `--set-upstream-to`, which needs the fetch to have
-  already produced `origin/<new>`.
-- **The container is a valid starting point:** it is a plain directory, so
-  `git rev-parse --show-toplevel` fails there. `find_stack_host` treats a
-  directory that is not a worktree as the container itself, which is what lets
-  `add`, `rename`, and `rebase` run from it.
-- **The setup hook gets `<container>/<layer>`:** hooks resolve their argument
-  against the repo root, and a layer sits one level down. Passing the bare
-  layer folder name broke every hook that checks the directory exists.
-- **Metadata is written, not just read:** `git branch -m` leaves gh stack naming
-  a branch that no longer exists, so `rename` rewrites the metadata too.
-- **Live PR state comes from `gh stack view --json`:** one call replaces N
-  `gh pr view` calls for a stack. It exits 2 outside a stack and omits the `pr`
-  key before submit, so both are handled as normal, not as errors.
-- **Agent-facing text is frozen:** `AGENT_SPLIT_POINTER` and
-  `AGENT_SPLIT_GUIDE` are string literals with no interpolation. Formatting a
-  branch name or PR title into them would turn remote-controlled data into
-  agent instructions.
-- **`output_is_piped()` gates the agent block and the PR prompt:** captured
-  stdout means an agent is reading. It is a named seam because
-  `io.StringIO.isatty` cannot be patched in tests.
-- **Stack verbs are reserved words, not subparsers:** `gh wt stack NAME`
-  already takes a positional, so `cli()` splits `add`/`rename`/`rebase`/`agent`
-  off before argparse (`parse_stack_verb`) and builds the same namespace the
-  old `--add`/`--rename`/`--rebase`/`--agent` flags produce. Those flags stay
-  as hidden aliases; a verb cannot name layer 1.
-- **`gh wt stack` refuses trunk:** `gh stack init main` succeeds and creates a
-  nonsense `main <- main` stack. It also refuses detached HEADs, already-stacked
-  worktrees (`gh stack init` is not idempotent), and a missing extension.
-- **`rerere` is set by gh-wt:** `gh stack init` does not enable it despite its
-  README. `enable_rerere` writes to the shared `.bare/config`.
-- **Deleted current directory is handled once:** `check_current_dir()` runs in
-  `cli()` just before dispatch, so every command reports the same friendly error
-  instead of a `Path.cwd()` traceback. It reads the vanished path from `$PWD`,
-  which survives as a string, and walks up to the nearest surviving ancestor for
-  the suggested `cd`. `rm` additionally calls `hint_if_cwd_removed()` to flag the
-  stranding at its source, since `rm` is what usually causes it.
-
-## Testing Notes
-
-- Tests exercise behavior through public command paths and helper functions.
-- External Git/GitHub operations are mocked where possible.
-- Keep command-line behavior backward-compatible unless the README is updated in
-  the same change.
+Use the repository-owned Makefile and .devcontainer configuration. `make check`
+runs the Pixi-backed toolchain in a container; no host dependency installs.
+Retain ordinary regressions and exercise native-stack behavior with isolated
+real-Git fixtures, without credentials, real PR mutations or service changes.
+Verify before claiming completion. Installing this checkout globally requires
+separate intent; normal implementation and test work must not replace an active
+extension link.

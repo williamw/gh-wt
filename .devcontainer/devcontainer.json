@@ -1,0 +1,9 @@
+{
+  "name": "gh-wt",
+  "build": { "dockerfile": "Dockerfile", "context": ".." },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "runArgs": ["--cpus=2", "--memory=2g"],
+  "containerEnv": { "PYTHONDONTWRITEBYTECODE": "1" },
+  "remoteUser": "root"
+}

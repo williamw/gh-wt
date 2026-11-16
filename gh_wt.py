@@ -1,12 +1,11 @@
 """GitHub CLI extension for bare-git worktree management."""
 
-import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -23,49 +22,27 @@ NEW_SETUP_SCRIPT_NAME = "worktree-setup.sh"
 OLD_SETUP_SCRIPT_NAME = "setup-worktree.sh"
 REMOTE_TRACKING_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 
-STACK_METADATA_NAME = "gh-stack"
-STACK_OVERSIZED_COMMITS = 3
-STACK_OVERSIZED_LINES = 500
-
-# Addressed to AI agents reading gh-wt output. Both blocks are frozen literals:
-# never interpolate branch names, PR titles, or anything else fetched from the
-# remote into them, or a hostile branch name becomes an instruction channel.
-AGENT_SPLIT_POINTER = """\
-Agents: this branch is likely too large for one review. Run
-'gh wt stack agent' for the layer-splitting procedure, then offer
-to split it with the user."""
-
+# Static guidance must never interpolate remote branch names or PR titles.
 AGENT_SPLIT_GUIDE = """\
-gh wt stack - splitting an oversized bottom layer
+gh wt stack - independent worktrees for native stacks
 
-The user converted a worktree into a stack. Conversion renamed the branch and
-moved it into its own layer folder, so the container now holds one folder per
-layer. The bottom layer still holds every commit, which is usually too much for
-one review. Offer to split it, and follow this procedure if they accept.
+1. Inspect gh stack view --json and git worktree list --porcelain before work.
+   Branch membership comes from gh stack, never folder names.
+2. Agree on reviewable layers with the user before restructuring existing work.
+   Use gh stack init or gh stack link to establish membership, then
+   gh stack checkout <stack> and gh wt stack setup to create missing worktrees.
+3. Use gh wt stack add <name> for a new top layer with its own flat worktree.
+   Move between existing layers with cd to their actual paths.
+4. Commit a fix in the layer that owns it. Coordinate affected agents before
+   native gh stack rebase, push, submit, sync or merge. Inspect each command's
+   help for its effects; use gh stack rebase --continue or --abort for recovery.
+5. Verify each layer independently. Check git config --get rerere.enabled
+   rather than assuming repeated conflict resolutions are recorded.
+6. Remove individual worktrees deliberately with gh wt rm <folder> --keep-branch.
+   Review service ownership and retained data before any cleanup.
 
-1. Read the diff against trunk and group changed files into layers that each
-   stand alone: a layer should build, pass its own tests, and be reviewable
-   without the layers above it.
-2. Split by file path, not by commit. Commits in the original history were
-   never required to be individually green; file groups can be.
-3. Create each layer with 'gh wt stack add <name>'. It numbers the layer,
-   names its branch to match its folder, and gives it its own worktree.
-4. Build upward from the bottom: in the bottom layer's folder, reset the files
-   belonging higher and commit, then add the next layer and restore that
-   layer's files in its own folder. Repeat to the top.
-5. Verify each layer independently before moving up. A layer that cannot be
-   made green means the cut is in the wrong place; fold it into its neighbour
-   rather than shipping it red.
-6. Each layer has its own worktree, so layers can be worked in parallel. Never
-   run 'gh stack rebase' directly - it checks each branch out in the bottom
-   layer's folder and fails on any branch another worktree holds. Run
-   'gh wt stack rebase', which frees the layer worktrees first and puts them
-   back afterwards. Every agent must be idle and committed before it runs.
-7. rerere is enabled, so repeated conflict resolutions stick across the
-   cascading rebases that follow review feedback.
-
-Useful commands: gh wt stack add, gh wt stack rename, gh wt stack rebase,
-gh stack view, gh stack submit."""
+Conversion, grouped containers, branch renaming and wrapper rebases were removed.
+Native gh stack owns stack membership, history, PR publication and recovery."""
 
 SETUP_WORKTREE_TEMPLATE = """\
 #!/usr/bin/env bash
@@ -479,709 +456,239 @@ def resolve_git_dir(worktree_path: Path) -> Optional[Path]:
     return worktree_path / pointer.removeprefix("gitdir:").strip()
 
 
-def read_stack_metadata(worktree_path: Path) -> Optional[dict]:
-    """Read gh-stack metadata for a worktree, or None when it hosts no stack.
-
-    gh stack stores metadata in the worktree's own git dir, not the common dir,
-    so this resolves that rather than guessing from the folder name (which goes
-    stale as soon as the stack moves between layers).
-    """
-    git_dir = resolve_git_dir(worktree_path)
-    if not git_dir:
-        return None
-
-    try:
-        return json.loads((git_dir / STACK_METADATA_NAME).read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def stack_layers(metadata: dict) -> list[str]:
-    """Return every stacked branch name, bottom layer first."""
-    layers = []
-    for stack in metadata.get("stacks", []):
-        for entry in stack.get("branches", []):
-            branch = entry.get("branch")
-            if branch:
-                layers.append(branch)
-    return layers
-
-
-def stack_number(metadata: dict) -> Optional[int]:
-    """Return the GitHub stack number, when the stack has been submitted."""
-    for stack in metadata.get("stacks", []):
-        if stack.get("number"):
-            return stack["number"]
-    return None
-
-
-def layer_folder_name(position: int, name: str = "") -> str:
-    """Name a layer folder: '01' bare, '02-api' when the layer has a name.
-
-    A name may carry its own number, since rename takes whole folder names
-    and '02-api' reads as the obvious thing to type. It must be the right one.
-    """
-    number = f"{position:02d}"
-    given, _, rest = name.partition("-")
-    if rest and len(given) == 2 and given.isdigit():
-        if given != number:
-            print(
-                f"Error: '{name}' would be layer {number}; name it '{number}-{rest}' or just '{rest}'.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        name = rest
-    return f"{number}-{name}" if name else number
-
-
-def layer_branch_name(stack_root: str, folder: str) -> str:
-    """Branch for a layer, nested under the stack root so both spell the same."""
-    return f"{stack_root}/{folder}"
-
-
-def stack_branch_root(layer_branch: str) -> str:
-    """The ref path layers nest under: 'billw/x/02-api' -> 'billw/x'."""
-    return layer_branch.rsplit("/", 1)[0]
-
-
-def find_stack_worktree_for_branch(repo_root: Path, branch: str) -> Optional[tuple[Path, int]]:
-    """Find the worktree hosting a stack containing branch, with its layer number.
-
-    Reads local metadata only, so this stays offline and cheap enough to run on
-    every 'gh wt add'.
-    """
-    for _folder, _branch, worktree_path in get_worktree_branches(repo_root):
-        metadata = read_stack_metadata(Path(worktree_path))
-        if not metadata:
-            continue
-        layers = stack_layers(metadata)
-        if branch in layers:
-            return Path(worktree_path), layers.index(branch) + 1
-    return None
-
-
-def get_stack_view(worktree_path: Path) -> Optional[dict]:
-    """Return live 'gh stack view --json' data, or None when it is unavailable."""
-    try:
-        result = subprocess.run(
-            ["gh", "stack", "view", "--json"],
-            cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-
-    if result.returncode != 0 or not result.stdout:
-        return None
-    try:
-        return json.loads(result.stdout)
-    except ValueError:
-        return None
-
-
-def is_gh_stack_installed() -> bool:
-    """Report whether the gh stack extension is available."""
-    try:
-        result = subprocess.run(
-            ["gh", "stack", "--version"], capture_output=True, text=True, check=False
-        )
-    except OSError:
-        return False
-    return result.returncode == 0
-
-
-def measure_branch_against_trunk(worktree_path: Path, trunk: str) -> tuple[int, int]:
-    """Return commits ahead of trunk and lines changed against it."""
-    commits = run_git(
-        ["rev-list", "--count", f"{trunk}..HEAD"], cwd=str(worktree_path), check=False
-    )
-    shortstat = run_git(
-        ["diff", "--shortstat", f"{trunk}...HEAD"], cwd=str(worktree_path), check=False
-    )
-
-    lines = 0
-    for part in shortstat.split(","):
-        if "insertion" in part or "deletion" in part:
-            lines += int(part.strip().split()[0])
-    return int(commits or "0"), lines
-
-
-def enable_rerere(bare_dir: Path) -> None:
-    """Turn on rerere so conflict resolutions survive the cascading rebases.
-
-    gh stack's README claims init does this; it does not. In a bare layout this
-    writes to .bare/config, shared by every worktree.
-    """
-    if run_git(["config", "--get", "rerere.enabled"], cwd=str(bare_dir), check=False) == "true":
-        return
-
-    print("Enabling rerere...")
-    run_git(["config", "rerere.enabled", "true"], cwd=str(bare_dir))
-
-
-def output_is_piped() -> bool:
-    """Report whether stdout is captured rather than shown in a terminal.
-
-    An agent running 'gh wt stack' captures output; a human does not. This is
-    what gates the agent-facing block.
-    """
-    return not sys.stdout.isatty()
-
-
-def warn_if_bottom_layer_is_oversized(worktree_path: Path, trunk: str) -> None:
-    """Warn when the adopted bottom layer is still too large to review at once."""
-    commits, lines = measure_branch_against_trunk(worktree_path, trunk)
-    if commits <= STACK_OVERSIZED_COMMITS and lines <= STACK_OVERSIZED_LINES:
-        return
-
-    print()
-    print(f"Note: this branch is {commits} commits / {lines} lines. The bottom layer is")
-    print("still too large for one review. Redistribute with 'gh stack modify'.")
-
-    if output_is_piped():
-        print()
-        print(AGENT_SPLIT_POINTER)
-
-
-STACK_MOVE_TEMP_PREFIX = "."
-STACK_MOVE_TEMP_SUFFIX = ".tmp"
-
-
-def stack_move_temp_path(worktree_path: Path) -> Path:
-    """Sibling path a worktree parks at while its folder becomes a container."""
-    name = f"{STACK_MOVE_TEMP_PREFIX}{worktree_path.name}{STACK_MOVE_TEMP_SUFFIX}"
-    return worktree_path.parent / name
-
-
-def rename_remote_branch(old: str, new: str, cwd: Path) -> bool:
-    """Rename a branch on GitHub, which closes any PR it is the head of.
-
-    GitHub retargets PRs based on the branch but closes the one it heads, so
-    callers gate this behind an explicit confirmation.
-
-    GitHub rejects a rename where one name nests under the other (layer 1's
-    `feat` -> `feat/01-base`) as an invalid branch name, because the old ref
-    still occupies the path. Those go through a sibling name first, waiting
-    out the moment GitHub keeps the old ref after a rename returns.
-    """
-    if new.startswith(f"{old}/") or old.startswith(f"{new}/"):
-        temp = f"{old}.gh-wt-rename"
-        return (
-            rename_remote_branch(old, temp, cwd)
-            and wait_for_remote_branch_to_go(old, cwd)
-            and rename_remote_branch(temp, new, cwd)
-        )
-
-    result = subprocess.run(
-        ["gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/branches/{old}/rename",
-         "-f", f"new_name={new}"],
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print(f"Error: could not rename {old} on origin.", file=sys.stderr)
-        print(result.stderr.strip() or result.stdout.strip(), file=sys.stderr)
-        return False
-    return True
-
-
-REMOTE_BRANCH_GONE_TIMEOUT = 15.0
-
-
-def wait_for_remote_branch_to_go(branch: str, cwd: Path) -> bool:
-    """Poll until GitHub stops serving a branch it has just renamed away."""
-    deadline = time.monotonic() + REMOTE_BRANCH_GONE_TIMEOUT
-    while time.monotonic() < deadline:
-        result = subprocess.run(
-            ["gh", "api", f"repos/{{owner}}/{{repo}}/git/ref/heads/{branch}"],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return True
-        time.sleep(0.5)
-
-    print(f"Error: origin still has {branch} after renaming it away.", file=sys.stderr)
-    return False
-
-
-def ensure_rename_is_allowed(branch: str, action: str) -> None:
-    """Stop when renaming would close an open PR, unless the user insists.
-
-    Prompts on a terminal; a captured run must pass --force, so an agent can
-    never close a PR by omission.
-    """
-    pr_info = get_pr_info(branch)
-    if not pr_info or pr_info.get("error") or pr_info.get("state") != "OPEN":
-        return
-
-    number = pr_info.get("number")
-    if output_is_piped():
-        print(
-            f"Error: {branch} has an open PR (#{number}); renaming it will close that PR.",
-            file=sys.stderr,
-        )
-        print("Re-run with --force to continue anyway.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"{branch} has an open PR (#{number}). Renaming it for the stack will close that PR.")
-    if not confirm(f"{action} anyway? [y/N] "):
-        print("Aborted.")
-        sys.exit(1)
-
-
-def rename_stack_branch(old: str, new: str, bare_dir: Path, worktree_path: Path) -> None:
-    """Rename a layer branch locally and on origin, then refresh tracking refs.
-
-    git branch -m carries the old upstream over verbatim, so the renamed branch
-    would keep tracking a remote name that no longer exists. It is repointed
-    in config rather than with --set-upstream-to, which needs the fetch above
-    to have already produced origin/<new>.
-    """
-    on_origin = remote_branch_exists(bare_dir, old)
-    if on_origin:
-        if not rename_remote_branch(old, new, worktree_path):
-            sys.exit(1)
-
-    run_git(["branch", "-m", old, new], cwd=str(bare_dir))
-    run_git(["fetch", "--prune", "origin"], cwd=str(bare_dir), check=False)
-    if on_origin:
-        run_git(["config", f"branch.{new}.remote", "origin"], cwd=str(bare_dir))
-        run_git(["config", f"branch.{new}.merge", f"refs/heads/{new}"], cwd=str(bare_dir))
-
-
-def move_worktree_into_container(bare_dir: Path, worktree_path: Path, folder: str) -> Path:
-    """Turn a worktree folder into a container holding that worktree as a layer.
-
-    Git refuses to move a worktree into its own subdirectory, so this parks it
-    at a sibling first. A run interrupted between the two moves leaves the
-    worktree at that sibling, which the next run reports rather than guesses at.
-    """
-    temp_path = stack_move_temp_path(worktree_path)
-    layer_path = worktree_path / folder
-
-    run_git(["worktree", "move", str(worktree_path), str(temp_path)], cwd=str(bare_dir))
-    worktree_path.mkdir()
-    run_git(["worktree", "move", str(temp_path), str(layer_path)], cwd=str(bare_dir))
-    return layer_path
-
-
-def report_interrupted_move(worktree_path: Path) -> None:
-    """Report a conversion that died between the two worktree moves."""
-    temp_path = stack_move_temp_path(worktree_path)
-    if not temp_path.exists():
-        return
-
-    print(
-        f"Error: a previous conversion left a worktree at {temp_path.name}.",
-        file=sys.stderr,
-    )
-    print("Move it back, then retry:", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"  git worktree move {temp_path.name} {worktree_path.name}", file=sys.stderr)
-    sys.exit(1)
-
-
 def local_branch_exists(bare_dir: Path, branch: str) -> bool:
-    """Check whether the branch exists locally."""
-    return bool(
-        run_git(["branch", "--list", branch], cwd=str(bare_dir), check=False)
-    )
+    return bool(run_git(["show-ref", "--verify", f"refs/heads/{branch}"],
+                        cwd=str(bare_dir), check=False))
 
 
-def run_gh_stack(args: list[str], cwd: Path) -> None:
-    """Run a gh stack subcommand, reporting its own error text on failure."""
-    result = subprocess.run(
-        ["gh", "stack", *args], cwd=str(cwd), capture_output=True, text=True, check=False
-    )
-    if result.returncode != 0:
-        print(f"Error: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
-        sys.exit(1)
+def stack_command(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["gh", "stack", *args], cwd=str(cwd),
+                              capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(["gh", "stack", *args], 127, "", "gh is not installed")
 
 
-def find_stack_host(repo_root: Path, start: Path) -> Optional[Path]:
-    """The worktree holding stack metadata for the stack `start` sits in.
-
-    Layers are sibling worktrees inside one container folder, and only the
-    bottom layer carries gh stack's metadata, so a layer finds its host by
-    looking across the container rather than at itself. The container is a
-    plain directory, so from there `start` itself is the container.
-    """
-    toplevel = run_git(["rev-parse", "--show-toplevel"], cwd=str(start), check=False)
-    if not toplevel:
-        container = start.resolve()
-    elif read_stack_metadata(Path(toplevel)):
-        return Path(toplevel)
-    else:
-        container = Path(toplevel).parent
-    for _, _, path in get_worktree_branches(repo_root):
-        candidate = Path(path)
-        if candidate.parent == container and read_stack_metadata(candidate):
-            return candidate
+def stack_version_error(cwd: Path) -> Optional[str]:
+    result = stack_command(["--version"], cwd)
+    version = re.search(r"(?:version\s+|v)(\d+)\.(\d+)\.(\d+)", result.stdout)
+    if result.returncode or not version:
+        return (result.stderr.strip() or result.stdout.strip() or "gh stack is unavailable") + "; gh stack >=0.3.0 is required"
+    if tuple(map(int, version.groups())) < (0, 3, 0):
+        return "gh stack >=0.3.0 is required; upgrade with gh extension upgrade gh-stack"
     return None
 
 
-def layer_worktree_paths(repo_root: Path, container: Path) -> list[Path]:
-    """Every worktree sitting inside a stack container, in folder order."""
-    paths = [
-        Path(path)
-        for _, _, path in get_worktree_branches(repo_root)
-        if Path(path).parent == container
-    ]
-    return sorted(paths, key=lambda path: path.name)
+def get_stack_view(worktree_path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """Read supported JSON; preserve typed absence, ambiguity and upstream errors."""
+    result = stack_command(["view", "--json"], worktree_path)
+    if result.returncode == 2:
+        message = result.stderr.strip()
+        # Exit 2 also covers unreadable state and detached HEAD. Those are not
+        # proof that a branch is untracked.
+        if "not part of a stack" in message or "not in a stack" in message:
+            return None, None
+        return None, message or "Stack tracking unavailable (exit 2)"
+    if result.returncode:
+        return None, result.stderr.strip() or result.stdout.strip() or f"gh stack exited {result.returncode}"
+    try:
+        view = json.loads(result.stdout)
+        if not isinstance(view, dict) or not isinstance(view.get("trunk"), str):
+            raise ValueError("missing trunk")
+        layers = view.get("branches")
+        if not isinstance(layers, list) or not layers:
+            raise ValueError("missing branches")
+        names = [layer["name"] for layer in layers]
+        if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("invalid branch membership")
+        return view, None
+    except (ValueError, KeyError, TypeError) as error:
+        return None, f"Invalid gh stack view --json output: {error}"
 
 
-def find_busy_layer(layer_paths: list[Path]) -> Optional[Path]:
-    """The first layer worktree with a rebase or merge in progress."""
-    for path in layer_paths:
+def require_current_stack(repo_root: Path) -> dict:
+    error = stack_version_error(repo_root)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+    view, error = get_stack_view(Path.cwd())
+    if error or not view:
+        print(f"Error: {error or 'No tracked stack for the current branch. Use gh stack checkout <stack> first.'}", file=sys.stderr)
+        sys.exit(1)
+    return view
+
+
+def stack_identity(view: dict) -> tuple:
+    return view["trunk"], tuple(layer["name"] for layer in view["branches"])
+
+
+def discover_stacks(repo_root: Path, worktrees: list, allow_untracked: bool = False) -> tuple[list[dict], list[str]]:
+    """Query owners independently: a shared catalog can contain several stacks."""
+    error = stack_version_error(repo_root)
+    if error:
+        # Existence is only a conservative tracking signal, never membership.
+        # Preserve ordinary rm when the optional extension was never used.
+        state_paths = [repo_root / ".bare" / "gh-stack"]
+        state_paths.extend(repo_root.glob(".bare/worktrees/*/gh-stack"))
+        if allow_untracked and not any(path.exists() for path in state_paths):
+            return [], []
+        return [], [error]
+    stacks = {}
+    errors = []
+    for _, branch, path in worktrees:
+        if branch.startswith("("):
+            continue
+        view, error = get_stack_view(Path(path))
+        if error:
+            errors.append(f"{path}: {error}")
+        if view:
+            stacks[stack_identity(view)] = view
+    return list(stacks.values()), errors
+
+
+def worktree_owners(worktrees: list) -> dict[str, Path]:
+    owners = {}
+    for _, branch, path in worktrees:
+        if branch.startswith("("):
+            continue
+        if branch in owners:
+            print(f"Error: branch {branch!r} has multiple worktree owners", file=sys.stderr)
+            sys.exit(1)
+        owners[branch] = Path(path)
+    return owners
+
+
+def require_idle_worktrees(paths: list[Path]) -> None:
+    for path in paths:
         git_dir = resolve_git_dir(path)
         if not git_dir:
-            continue
-        if any(
-            (git_dir / marker).exists()
-            for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD")
-        ):
-            return path
-    return None
+            print(f"Error: worktree metadata unavailable: {path}", file=sys.stderr)
+            sys.exit(1)
+        markers = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "index.lock")
+        if any((git_dir / marker).exists() for marker in markers):
+            print(f"Error: worktree is busy: {path}. Finish its Git operation first.", file=sys.stderr)
+            sys.exit(1)
 
 
-def release_layer_worktrees(layer_paths: list[Path]) -> list[Path]:
-    """Detach layer worktrees so the host can check their branches out.
-
-    Detaching leaves each working tree exactly as it is, so an agent's
-    uncommitted work survives its branch moving underneath it.
-    """
-    released = []
-    for path in layer_paths:
-        branch = run_git(
-            ["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(path), check=False
-        )
-        if not branch or branch == "HEAD":
-            continue
-        run_git(["switch", "--detach"], cwd=str(path))
-        released.append(path)
-    return released
+def require_new_worktree_path(repo_root: Path, folder: str, branch: str, registered: list) -> Path:
+    path = repo_root / folder
+    if path.parent != repo_root or folder in ("", ".", "..", ".bare"):
+        print("Error: choose a single sibling folder name", file=sys.stderr)
+        sys.exit(1)
+    if path.exists() or path.is_symlink() or any(Path(item[2]) == path for item in registered):
+        print(f"Error: folder collision at {path}. Choose an alias with gh wt add <alias> -b {branch!r}, then rerun gh wt stack setup.", file=sys.stderr)
+        sys.exit(1)
+    return path
 
 
-def restore_layer_worktrees(layer_paths: list[Path], stack_root: str) -> int:
-    """Put every detached layer worktree back on the branch its folder names.
-
-    Folder and branch spell the same thing, so nothing has to be remembered
-    across a failure or across separate runs of rebase --continue.
-    """
-    restored = 0
-    for path in layer_paths:
-        head = run_git(
-            ["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(path), check=False
-        )
-        if head != "HEAD":
-            continue
-        run_git(
-            ["switch", layer_branch_name(stack_root, path.name)],
-            cwd=str(path),
-            check=False,
-        )
-        restored += 1
-    return restored
-
-
-@contextlib.contextmanager
-def layer_branches_released(layer_paths: list[Path], stack_root: str):
-    """Free layer branches for the host, and hand them back however it ends."""
-    released = release_layer_worktrees(layer_paths)
+def run_new_worktree_hook(repo_root: Path, invocation_dir: Path, path: Path, config: dict) -> None:
     try:
-        yield
-    finally:
-        restore_layer_worktrees(released, stack_root)
+        run_setup_worktree_hook(repo_root, invocation_dir, str(path.relative_to(repo_root)), config)
+    except SystemExit:
+        print(f"Error: setup hook failed. Worktree and branch remain at {path}; inspect them and rerun the hook manually. Existing worktrees were preserved.", file=sys.stderr)
+        raise
+
+
+def cmd_stack_setup(args, repo_root: Path) -> None:
+    view = require_current_stack(repo_root)
+    config = load_config(repo_root)
+    worktrees = get_worktree_branches(repo_root)
+    owners = worktree_owners(worktrees)
+    names = [layer["name"] for layer in view["branches"]]
+    require_idle_worktrees([owners[name] for name in names if name in owners])
+    missing = []
+    for branch in names:
+        if branch in owners:
+            print(f"Reuse {branch}: {owners[branch]}")
+            continue
+        if not local_branch_exists(repo_root / ".bare", branch):
+            print(f"Error: tracked branch {branch!r} is missing locally. Use gh stack checkout <stack> first.", file=sys.stderr)
+            sys.exit(1)
+        path = require_new_worktree_path(repo_root, branch.rsplit("/", 1)[-1], branch, worktrees)
+        if any(existing == path for _, existing in missing):
+            print(f"Error: multiple layers need {path}. Use gh wt add <alias> -b <branch> to choose distinct folders.", file=sys.stderr)
+            sys.exit(1)
+        missing.append((branch, path))
+    resolve_setup_script(repo_root, Path.cwd(), config)
+    for branch, path in missing:
+        print(f"{'Would create' if args.dry_run else 'Create'} {branch}: {path}")
+        if args.dry_run:
+            continue
+        result = run_git_result(["worktree", "add", str(path), branch], cwd=str(repo_root / ".bare"))
+        if result.returncode:
+            print(f"Error: {result.stderr.strip()}\nEarlier worktrees remain; inspect gh wt list before retrying setup.", file=sys.stderr)
+            sys.exit(1)
+        run_new_worktree_hook(repo_root, Path.cwd(), path, config)
+    print("Stack setup preview complete." if args.dry_run else "Stack worktrees ready.")
 
 
 def cmd_stack_add(args, repo_root: Path) -> None:
-    """Add a layer on top of the stack and give it its own worktree."""
+    view = require_current_stack(repo_root)
+    layers = view["branches"]
+    if all(layer.get("isMerged") for layer in layers):
+        print("Error: this stack is fully merged. Create a new stack with gh stack init.", file=sys.stderr)
+        sys.exit(1)
+    config = load_config(repo_root)
+    name = args.name
+    branch = name
+    prefix = get_branch_prefix(config)
+    if prefix and "/" not in name:
+        branch = f"{prefix}/{name}"
     bare_dir = repo_root / ".bare"
-    host = find_stack_host(repo_root, Path.cwd())
-    if not host:
-        print(
-            "Error: not inside a stack. Run 'gh wt stack' to convert this worktree first.",
-            file=sys.stderr,
-        )
+    worktrees = get_worktree_branches(repo_root)
+    owners = worktree_owners(worktrees)
+    top = layers[-1]["name"]
+    require_idle_worktrees([owners[layer["name"]] for layer in layers if layer["name"] in owners])
+    path = require_new_worktree_path(repo_root, name.rsplit("/", 1)[-1], branch, worktrees)
+    if run_git_result(["check-ref-format", "--branch", branch], cwd=str(bare_dir)).returncode:
+        print(f"Error: invalid branch name: {branch!r}", file=sys.stderr)
         sys.exit(1)
-
-    layers = stack_layers(read_stack_metadata(host) or {})
-    container = host.parent
-    stack_root = stack_branch_root(layers[0])
-
-    folder = layer_folder_name(len(layers) + 1, args.add)
-    layer_branch = layer_branch_name(stack_root, folder)
-    layer_path = container / folder
-
-    if layer_path.exists() or local_branch_exists(bare_dir, layer_branch):
-        print(f"Error: layer '{folder}' already exists.", file=sys.stderr)
+    if local_branch_exists(bare_dir, branch):
+        print(f"Error: branch {branch!r} already exists. Choose a new layer name.", file=sys.stderr)
         sys.exit(1)
-
-    # Positions keep folders unique, so two layers can both be called "api"
-    # without colliding. That is a mistake rather than a feature.
-    existing = [layer.rsplit("/", 1)[-1] for layer in layers]
-    if args.add and any(name.split("-", 1)[-1] == args.add for name in existing):
-        clash = next(name for name in existing if name.split("-", 1)[-1] == args.add)
-        print(f"Error: layer '{args.add}' already exists as {clash}.", file=sys.stderr)
+    remote = run_git_result(["ls-remote", "--heads", "origin", f"refs/heads/{branch}"], cwd=str(bare_dir))
+    if remote.returncode:
+        print(f"Error: could not check remote branch collision: {remote.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
-
-    others = [path for path in layer_worktree_paths(repo_root, container) if path != host]
-
-    busy = find_busy_layer(others)
-    if busy:
-        print(
-            f"Error: {busy.name} has a rebase in progress; finish or abort it first.",
-            file=sys.stderr,
-        )
+    if remote.stdout.strip():
+        print(f"Error: branch {branch!r} already exists on origin. Choose a new layer name.", file=sys.stderr)
         sys.exit(1)
-
-    print(f"Adding layer {folder}...")
-    with layer_branches_released(others, stack_root):
-        run_gh_stack(["top"], host)
-        run_gh_stack(["add", layer_branch], host)
-        run_git(["switch", layers[0]], cwd=str(host))
-
-    run_git(["worktree", "add", str(layer_path), layer_branch], cwd=str(bare_dir))
-    print(f"Created {layer_branch}")
-
-    # Pushed like `gh wt add` does. The layer already exists by now, so a
-    # failed push is a warning: gh stack submit pushes it later anyway.
+    resolve_setup_script(repo_root, Path.cwd(), config)
+    # Native add adopts a foreign-owned new branch without moving the top
+    # owner. Without a top owner it may switch only the new destination.
+    if top in owners:
+        run_git(["worktree", "add", "-b", branch, str(path), top], cwd=str(bare_dir))
+        adoption_dir = owners[top]
+    else:
+        run_git(["worktree", "add", str(path), top], cwd=str(bare_dir))
+        adoption_dir = path
+    result = stack_command(["add", branch], adoption_dir)
+    if result.returncode:
+        print(f"Error: {result.stderr.strip() or result.stdout.strip()}\nWorktree and branch remain at {path}. Inspect gh stack view before retrying adoption from the top layer.", file=sys.stderr)
+        sys.exit(result.returncode)
+    if result.stdout:
+        print(result.stdout.strip())
     if not args.local:
-        pushed = run_git_result(["push", "-u", "origin", layer_branch], cwd=str(layer_path))
-        if pushed.returncode != 0:
-            print(f"Warning: could not push {layer_branch}; the layer is local only.", file=sys.stderr)
-            print(pushed.stderr.strip(), file=sys.stderr)
-
-    # The hook takes the worktree's path under the repo root, and a layer sits
-    # one level down, inside its container.
-    hook_arg = str(layer_path.relative_to(repo_root))
-    run_setup_worktree_hook(repo_root, Path.cwd(), hook_arg, load_config(repo_root))
-    print(f"Worktree created. To use it, run:\n\ncd {os.path.relpath(layer_path)}")
-
-
-def write_stack_metadata(worktree_path: Path, metadata: dict) -> None:
-    """Write gh stack's metadata back into the worktree's own git dir."""
-    git_dir = resolve_git_dir(worktree_path)
-    if not git_dir:
-        print("Error: could not locate the stack metadata.", file=sys.stderr)
-        sys.exit(1)
-    (git_dir / STACK_METADATA_NAME).write_text(json.dumps(metadata, indent=2))
-
-
-def rename_layer_in_metadata(metadata: dict, old: str, new: str) -> dict:
-    """Point stack metadata at a renamed layer branch.
-
-    git branch -m leaves gh stack's metadata naming a branch that no longer
-    exists, so a rename has to rewrite both.
-    """
-    for stack in metadata.get("stacks", []):
-        for entry in stack.get("branches", []):
-            if entry.get("branch") == old:
-                entry["branch"] = new
-    return metadata
-
-
-def cmd_stack_rename(args, repo_root: Path) -> None:
-    """Rename a layer's folder, branch, and metadata entry together."""
-    bare_dir = repo_root / ".bare"
-    old_folder, new_folder = args.rename
-
-    host = find_stack_host(repo_root, Path.cwd())
-    if not host:
-        print(
-            "Error: not inside a stack. Run 'gh wt stack' to convert this worktree first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    metadata = read_stack_metadata(host) or {}
-    layers = stack_layers(metadata)
-    container = host.parent
-    stack_root = stack_branch_root(layers[0])
-
-    old_branch = layer_branch_name(stack_root, old_folder)
-    if old_branch not in layers:
-        print(f"Error: no layer named '{old_folder}'.", file=sys.stderr)
-        sys.exit(1)
-
-    new_branch = layer_branch_name(stack_root, new_folder)
-    new_path = container / new_folder
-    if new_path.exists() or local_branch_exists(bare_dir, new_branch):
-        print(f"Error: layer '{new_folder}' already exists.", file=sys.stderr)
-        sys.exit(1)
-
-    old_path = container / old_folder
-    if not args.force:
-        ensure_rename_is_allowed(old_branch, "Rename")
-
-    rename_stack_branch(old_branch, new_branch, bare_dir, old_path)
-    write_stack_metadata(host, rename_layer_in_metadata(metadata, old_branch, new_branch))
-    run_git(["worktree", "move", str(old_path), str(new_path)], cwd=str(bare_dir))
-
-    print(f"Renamed layer {old_folder} to {new_folder}")
-    print(f"Renamed branch {old_branch} to {new_branch}")
-
-
-def cmd_stack_rebase(args, repo_root: Path) -> None:
-    """Cascade the stack with its layer worktrees temporarily out of the way.
-
-    gh stack rebase checks each layer out in the host, so every other worktree
-    has to let go of its branch first.
-    """
-    host = find_stack_host(repo_root, Path.cwd())
-    if not host:
-        print(
-            "Error: not inside a stack. Run 'gh wt stack' to convert this worktree first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    layers = stack_layers(read_stack_metadata(host) or {})
-    container = host.parent
-    stack_root = stack_branch_root(layers[0])
-    others = [path for path in layer_worktree_paths(repo_root, container) if path != host]
-
-    if args.rebase_continue:
-        result = subprocess.run(
-            ["gh", "stack", "rebase", "--continue"],
-            cwd=str(host), capture_output=True, text=True, check=False,
-        )
-        if result.returncode != 0:
-            print(f"Error: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+        result = run_git_result(["push", "-u", "origin", branch], cwd=str(path))
+        if result.returncode:
+            print(f"Error: {result.stderr.strip()}\nLayer remains tracked at {path}; retry git push -u origin {branch!r} there.", file=sys.stderr)
             sys.exit(1)
-        restored = restore_layer_worktrees(others, stack_root)
-        print(f"Restored {restored} layer {'worktree' if restored == 1 else 'worktrees'}.")
-        return
-
-    busy = find_busy_layer(others)
-    if busy:
-        print(
-            f"Error: {busy.name} has a rebase in progress; finish or abort it first.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    released = release_layer_worktrees(others)
-    count = len(released)
-    print(f"Detaching {count} layer {'worktree' if count == 1 else 'worktrees'}...")
-
-    print("Rebasing stack..." if not args.no_trunk else "Rebasing stack layers (trunk skipped)...")
-    result = subprocess.run(
-        ["gh", "stack", "rebase", *(["--no-trunk"] if args.no_trunk else [])],
-        cwd=str(host), capture_output=True, text=True, check=False,
-    )
-
-    if result.returncode != 0:
-        # Leave the layers detached: restoring them now would take back the
-        # branch the half-finished rebase still needs.
-        print(result.stdout.strip() or result.stderr.strip(), file=sys.stderr)
-        print(file=sys.stderr)
-        print(
-            f"Resolve in {host.name}, then run 'gh wt stack rebase --continue'.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    restored = restore_layer_worktrees(released, stack_root)
-    print(f"Restored {restored} layer {'worktree' if restored == 1 else 'worktrees'}.")
+    run_new_worktree_hook(repo_root, Path.cwd(), path, config)
+    print(f"Worktree created. To use it, run:\n\ncd {path}")
 
 
 def cmd_stack(args):
-    """Convert the current worktree into the host for a stack of PRs."""
-    if args.agent:
+    if args.stack_command == "agent":
         print(AGENT_SPLIT_GUIDE)
         return
-
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
         sys.exit(1)
-
-    if args.add:
+    if args.stack_command == "setup":
+        cmd_stack_setup(args, repo_root)
+    elif args.stack_command == "add":
         cmd_stack_add(args, repo_root)
-        return
-
-    if args.rename:
-        cmd_stack_rename(args, repo_root)
-        return
-
-    if args.rebase or args.rebase_continue:
-        cmd_stack_rebase(args, repo_root)
-        return
-
-    bare_dir = repo_root / ".bare"
-    worktree_path = Path(run_git(["rev-parse", "--show-toplevel"]))
-    branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(worktree_path), check=False)
-    trunk = get_default_branch_name(repo_root)
-
-    if not branch or branch == "HEAD":
-        print("Error: worktree is not on a branch. Check one out first.", file=sys.stderr)
-        sys.exit(1)
-
-    if branch == trunk:
-        print(f"Error: refusing to stack the trunk branch '{branch}'.", file=sys.stderr)
-        print("Create a feature worktree first: gh wt add <name>", file=sys.stderr)
-        sys.exit(1)
-
-    if read_stack_metadata(worktree_path):
-        print(
-            f"Error: {worktree_path.name} already hosts a stack. Run 'gh stack view' to see it.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    if not is_gh_stack_installed():
-        print("Error: gh stack is not installed.", file=sys.stderr)
-        print("Install it with: gh extension install github/gh-stack", file=sys.stderr)
-        sys.exit(1)
-
-    report_interrupted_move(worktree_path)
-
-    folder = layer_folder_name(1, args.name or "")
-    layer_branch = layer_branch_name(branch, folder)
-
-    if not args.force:
-        ensure_rename_is_allowed(branch, "Convert")
-
-    enable_rerere(bare_dir)
-
-    print(f"Converting {worktree_path.name} into a stack...")
-    rename_stack_branch(branch, layer_branch, bare_dir, worktree_path)
-    print(f"Renamed {branch} to {layer_branch}")
-
-    layer_path = move_worktree_into_container(bare_dir, worktree_path, folder)
-    print(f"Moved worktree to {worktree_path.name}/{folder}")
-
-    result = subprocess.run(
-        ["gh", "stack", "init", layer_branch],
-        cwd=str(layer_path),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print(f"Error: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
-        sys.exit(1)
-
-    print()
-    print(f"Stack created: {trunk} <- {layer_branch}")
-    print()
-    print("Add the next layer with:")
-    print()
-    print("  gh wt stack add <name>")
-    print()
-    print("Your shell is still at the old path. To continue:")
-    print()
-    print(f"  cd {worktree_path.name}/{folder}")
-
-    warn_if_bottom_layer_is_oversized(layer_path, trunk)
 
 
 def cmd_clone(args):
@@ -1487,22 +994,6 @@ def cmd_add(args):
         checkout_branch = branch_name or branch
         remote_exists = remote_branch_exists(bare_dir, checkout_branch)
 
-    # Git only refuses the branch a worktree currently holds, so it would happily
-    # check out a sibling layer here and only fail later, mid 'gh stack rebase'.
-    hosting_stack = find_stack_worktree_for_branch(repo_root, checkout_branch)
-    if hosting_stack:
-        host_path, layer = hosting_stack
-        container = host_path.parent
-        folder = checkout_branch.rsplit("/", 1)[-1]
-        print(
-            f"Error: that branch is layer {layer} of the stack in {container.name}/.",
-            file=sys.stderr,
-        )
-        print("It already has a worktree. Work on it there:", file=sys.stderr)
-        print(file=sys.stderr)
-        print(f"  cd {container.name}/{folder}", file=sys.stderr)
-        sys.exit(1)
-
     worktree_path = repo_root / folder_name
 
     if worktree_path.exists():
@@ -1594,326 +1085,91 @@ def delete_remote_branch(branch: str, bare_dir: Path) -> None:
     run_git(["push", "origin", ":" + branch], cwd=str(bare_dir), check=False)
 
 
-def find_stack_container(repo_root: Path, folder: str) -> Optional[Path]:
-    """The container folder of a stack, when `folder` names one.
-
-    A container is a plain directory, not a worktree: the layers inside it are
-    the worktrees, and the bottom one carries the metadata.
-    """
-    container = repo_root / folder
-    if not container.is_dir():
-        return None
-
-    hosts = [
-        path
-        for path in layer_worktree_paths(repo_root, container)
-        if read_stack_metadata(path)
-    ]
-    return container if hosts else None
-
-
-def remove_stack_container(
-    container: Path,
-    repo_root: Path,
-    bare_dir: Path,
-    force: bool,
-    delete_remote: bool,
-) -> bool:
-    """Remove every layer worktree of a stack, then its branches and folder.
-
-    A stack is all-or-nothing, so nothing is removed until every layer has been
-    checked.
-    """
-    layer_paths = layer_worktree_paths(repo_root, container)
-    host = next((path for path in layer_paths if read_stack_metadata(path)), None)
-    layers = stack_layers(read_stack_metadata(host) or {}) if host else []
-
-    if not force:
-        for index, candidate in enumerate(layers, start=1):
-            if is_branch_safe_to_delete(candidate, str(bare_dir)):
-                continue
-            print(
-                f"Error: layer {index} ({candidate}) has unpushed commits. "
-                f"Use --force to override.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-    layer_word = "layer" if len(layers) == 1 else "layers"
-    print(f"Removing stack {container.name} ({len(layers)} {layer_word}).")
-
-    for path in layer_paths:
-        if not remove_worktree(str(path), str(bare_dir), force):
-            return False
-
-    for candidate in layers:
-        run_git(["branch", "-D", candidate], cwd=str(bare_dir), check=False)
-        if delete_remote:
-            delete_remote_branch(candidate, bare_dir)
-
-    if container.exists() and not any(container.iterdir()):
-        container.rmdir()
-
-    print(f"Removed {container.name}")
-    return True
-
-
-def find_host_beside(worktree_path: Path) -> Optional[Path]:
-    """The stack host sharing this worktree's container, if the container holds one.
-
-    Reads the filesystem only. The removal paths this guards run inside tightly
-    mocked git sequences, and a stray git call there would break them.
-    """
-    container = worktree_path.parent
-    if not container.is_dir():
-        return None
-
-    for sibling in sorted(container.iterdir()):
-        if sibling.is_dir() and read_stack_metadata(sibling):
-            return sibling
-    return None
-
-
-def refuse_removing_a_lone_layer(repo_root: Path, worktree_path: Path, branch: str) -> None:
-    """Stop a layer worktree being removed on its own, which would kill its branch."""
-    container = worktree_path.parent
-    if container == repo_root:
-        return
-
-    host = find_host_beside(worktree_path)
-    if not host:
-        return
-
-    layers = stack_layers(read_stack_metadata(host) or {})
-    position = layers.index(branch) + 1 if branch in layers else len(layers)
-    print(
-        f"Error: {worktree_path.name} is layer {position} of the stack in {container.name}/.",
-        file=sys.stderr,
-    )
-    print("Remove the whole stack instead:", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"  gh wt rm {container.name}", file=sys.stderr)
-    sys.exit(1)
-
-
 def cmd_rm(args):
-    """Remove a worktree or all worktrees with merged or closed PRs."""
-    folder = args.folder
-    delete_remote = args.delete_remote
-    merged = args.merged
-    force = args.force
+    """Remove only selected worktrees; preserve active stack refs explicitly."""
+    folder, merged, force = args.folder, args.merged, args.force
+    keep_branch = getattr(args, "keep_branch", False)
+    dry_run = getattr(args, "dry_run", False)
+    if merged and folder or not merged and not folder:
+        print("Error: specify one folder or --merged", file=sys.stderr)
+        sys.exit(1)
+    if keep_branch and args.delete_remote:
+        print("Error: --keep-branch cannot be combined with --delete-remote", file=sys.stderr)
+        sys.exit(1)
     invocation_dir = Path.cwd()
     repo_root = get_repo_root()
     if not repo_root:
         print("Error: Not in a bare-git repository", file=sys.stderr)
         sys.exit(1)
-
-    if merged and folder:
-        print("Error: Cannot specify both folder and --merged (-m) flag", file=sys.stderr)
-        sys.exit(1)
-
-    if not merged and not folder:
-        print("Error: folder argument is required (unless using --merged/-m)", file=sys.stderr)
-        sys.exit(1)
-
     bare_dir = repo_root / ".bare"
-
+    worktrees = get_worktree_branches(repo_root)
     if merged:
-        # Remove all worktrees with merged or closed PRs
-        worktrees = get_worktree_branches(repo_root)
-        removed_paths = []
-        skipped_branches = []
-        failed_folders = []
-
-        # Removing a stack takes every layer at once, so later entries in this
-        # snapshot may already be gone by the time the loop reaches them.
-        swept: set[Path] = set()
-
-        for folder_name, branch, worktree_path in worktrees:
-            # Skip detached or unknown branches
-            if branch.startswith("("):
-                continue
-
-            if Path(worktree_path) in swept:
-                continue
-
-            # Read layers before removal: stack metadata lives inside the
-            # worktree's git dir and is destroyed along with the worktree.
-            metadata = read_stack_metadata(Path(worktree_path))
-            layers = stack_layers(metadata) if metadata else []
-
-            # A layer above the bottom carries no metadata of its own. Sweeping
-            # it here would delete a live layer branch out of an intact stack.
-            if not layers and find_host_beside(Path(worktree_path)):
-                continue
-
-            # Layers spread across their own worktrees share a container folder
-            # below the repo root; a host sitting directly at the root is the
-            # older single-worktree layout and still removes in place.
-            container = Path(worktree_path).parent
-            if layers and container != repo_root:
-                if all(is_pr_removable(candidate) for candidate in layers):
-                    unsafe = [
-                        candidate for candidate in layers
-                        if not is_branch_safe_to_delete(candidate, str(bare_dir))
-                    ]
-                    if not force and unsafe:
-                        skipped_branches.extend(unsafe)
-                        continue
-                    swept.update(layer_worktree_paths(repo_root, container))
-                    if remove_stack_container(
-                        container, repo_root, bare_dir, force, delete_remote
-                    ):
-                        removed_paths.append(container)
-                    else:
-                        failed_folders.append(container.name)
-                continue
-
-            doomed_branches = layers or [branch]
-
-            # A stack is all-or-nothing: every layer's PR must be finished.
-            if all(is_pr_removable(candidate) for candidate in doomed_branches):
-                # Check safety BEFORE removing anything
-                unsafe = [
-                    candidate for candidate in doomed_branches
-                    if not is_branch_safe_to_delete(candidate, str(bare_dir))
-                ]
-                if not force and unsafe:
-                    skipped_branches.extend(unsafe)
-                    continue  # Skip this worktree entirely
-
-                if layers:
-                    layer_word = "layer" if len(layers) == 1 else "layers"
-                    print(f"Removing stack worktree {folder_name} ({len(layers)} {layer_word}).")
-                else:
-                    print(f"Removing {folder_name} ({branch})...")
-                if not remove_worktree(worktree_path, str(bare_dir), force):
-                    # Keep going: one stuck folder shouldn't strand the rest.
-                    failed_folders.append(folder_name)
-                    continue
-
-                for candidate in doomed_branches:
-                    if layers:
-                        # A stack deletes several branches; one stale ref must
-                        # not strand the layers behind it.
-                        run_git(["branch", "-D", candidate], cwd=str(bare_dir), check=False)
-                    else:
-                        run_git(["branch", "-D", candidate], cwd=str(bare_dir))
-
-                    # Optionally delete from remote
-                    if delete_remote:
-                        delete_remote_branch(candidate, bare_dir)
-
-                print(f"Removed {folder_name}")
-                removed_paths.append(Path(worktree_path))
-
-        hint_if_cwd_removed(invocation_dir, removed_paths)
-
-        if not removed_paths:
-            print("No merged or closed worktrees to remove")
-        else:
-            print(f"Removed {len(removed_paths)} merged or closed worktree(s)")
-
-        if skipped_branches:
-            print(
-                f"Error: Local branch(es) have unpushed commits: {', '.join(skipped_branches)}. "
-                f"Push changes first.",
-                file=sys.stderr
-            )
-
-        if failed_folders:
-            print(
-                f"Error: Could not remove: {', '.join(failed_folders)}. "
-                f"Their branches were left in place.",
-                file=sys.stderr
-            )
-
-        if skipped_branches or failed_folders:
-            sys.exit(1)
+        targets = [item for item in worktrees if not item[1].startswith("(") and is_pr_removable(item[1])]
     else:
-        container = find_stack_container(repo_root, folder)
-        if container:
-            if not remove_stack_container(
-                container, repo_root, bare_dir, force, delete_remote
-            ):
+        requested = (repo_root / folder).resolve()
+        targets = [item for item in worktrees if Path(item[2]) == requested]
+        if not targets:
+            matches = [item for item in worktrees if item[0] == folder]
+            if len(matches) > 1:
+                print(f"Error: ambiguous folder {folder!r}. Use its path from gh wt list.", file=sys.stderr)
                 sys.exit(1)
-            hint_if_cwd_removed(invocation_dir, [container])
-            return
-
-        worktree_path = repo_root / folder
-
-        if not worktree_path.exists():
-            registered_path = find_registered_worktree_record(folder, bare_dir)
-            if registered_path and registered_path.exists():
-                worktree_path = registered_path
-            elif registered_path:
-                prune_stale_worktree_record(folder, registered_path, bare_dir)
-                return
-            else:
-                print(f"Error: Worktree folder not found: {folder}", file=sys.stderr)
-                sys.exit(1)
-
-        branch = run_git(
-            ["rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(worktree_path),
-        )
-        if not branch or branch == "HEAD":
-            print(f"Removing {folder} (detached)...")
-            if not remove_worktree(str(worktree_path), str(bare_dir), force):
-                sys.exit(1)
-            print(f"Removed {folder}")
-            hint_if_cwd_removed(invocation_dir, [worktree_path])
-            return
-
-        refuse_removing_a_lone_layer(repo_root, worktree_path, branch)
-
-        # Read layers before removal: stack metadata lives inside the worktree's
-        # git dir and is destroyed along with the worktree.
-        metadata = read_stack_metadata(worktree_path)
-        layers = stack_layers(metadata) if metadata else []
-        doomed_branches = layers or [branch]
-
-        # Check safety BEFORE removing anything
-        if not force:
-            for index, candidate in enumerate(doomed_branches, start=1):
-                if is_branch_safe_to_delete(candidate, str(bare_dir)):
-                    continue
-                if layers:
-                    print(
-                        f"Error: layer {index} ({candidate}) has unpushed commits. "
-                        f"Use --force to override.",
-                        file=sys.stderr
-                    )
+            targets = matches
+        if not targets:
+            # A registered missing worktree is a deliberate stale-record cleanup.
+            registered = find_registered_worktree_record(folder, bare_dir)
+            if registered and not registered.exists():
+                if dry_run:
+                    print(f"Would prune stale worktree record: {registered}")
                 else:
-                    print(
-                        f"Error: Local branch '{candidate}' has unpushed commits. "
-                        f"Push changes first.",
-                        file=sys.stderr
-                    )
-                sys.exit(1)
-
-        if layers:
-            layer_word = "layer" if len(layers) == 1 else "layers"
-            print(f"Removing stack worktree {folder} ({len(layers)} {layer_word}).")
-        else:
-            print(f"Removing {folder} ({branch})...")
-        if not remove_worktree(str(worktree_path), str(bare_dir), force):
+                    prune_stale_worktree_record(folder, registered, bare_dir)
+                return
+            print(f"Error: registered worktree not found: {folder}. Use gh wt list for actual paths; grouped removal was removed.", file=sys.stderr)
             sys.exit(1)
-
-        for candidate in doomed_branches:
-            if layers:
-                # A stack deletes several branches; one stale ref must not
-                # strand the layers behind it.
-                run_git(["branch", "-D", candidate], cwd=str(bare_dir), check=False)
-            else:
-                run_git(["branch", "-D", candidate], cwd=str(bare_dir))
-
-            # Optionally delete from remote
-            if delete_remote:
-                delete_remote_branch(candidate, bare_dir)
-
-        print(f"Removed {folder}")
-        hint_if_cwd_removed(invocation_dir, [worktree_path])
+    if not merged and targets and not Path(targets[0][2]).exists():
+        stale = Path(targets[0][2])
+        if dry_run:
+            print(f"Would prune stale worktree record: {stale}")
+        else:
+            prune_stale_worktree_record(folder, stale, bare_dir)
+        return
+    stacks, errors = discover_stacks(repo_root, worktrees, allow_untracked=True) if not keep_branch and targets else ([], [])
+    active = {layer["name"] for view in stacks for layer in view["branches"] if not layer.get("isMerged")}
+    removed = []
+    failed = []
+    for label, branch, path in targets:
+        detached = branch.startswith("(")
+        if not keep_branch and not detached and (branch in active or errors):
+            reason = "active stack branch" if branch in active else "stack membership unavailable: " + "; ".join(errors)
+            print(f"Error: keeping {path}: {reason}. Use gh wt rm <folder> --keep-branch to remove only its worktree.", file=sys.stderr)
+            failed.append(label)
+            continue
+        require_idle_worktrees([Path(path)])
+        if not keep_branch and not detached and not force and not is_branch_safe_to_delete(branch, str(bare_dir)):
+            print(f"Error: Local branch {branch!r} has unpushed commits. Push changes first.", file=sys.stderr)
+            failed.append(label)
+            continue
+        status = run_git(["status", "--porcelain", "--ignored"], cwd=path, check=False)
+        if status and not force:
+            print(f"Error: {path} has local or ignored files. Preserve them before removal or use --force deliberately.", file=sys.stderr)
+            failed.append(label)
+            continue
+        print(f"{'Would remove' if dry_run else 'Removing'} {path} ({branch})" + ("; keep branch" if keep_branch else ""))
+        if dry_run:
+            continue
+        if not remove_worktree(path, str(bare_dir), force):
+            failed.append(label)
+            continue
+        removed.append(Path(path))
+        if not keep_branch and not detached:
+            run_git(["branch", "-D", branch], cwd=str(bare_dir))
+            if args.delete_remote:
+                delete_remote_branch(branch, bare_dir)
+    if not targets:
+        print("No merged or closed worktrees to remove")
+    hint_if_cwd_removed(invocation_dir, removed)
+    if failed:
+        print(f"Error: Could not remove: {', '.join(failed)}. Their branches were left in place.", file=sys.stderr)
+        sys.exit(1)
 
 
 def get_pr_info(branch: str) -> Optional[dict]:
@@ -1944,46 +1200,23 @@ def is_pr_removable(branch: str) -> bool:
 
 
 def get_worktree_branches(repo_root: Path) -> list[tuple[str, str, str]]:
-    """Get list of worktrees with their folder names, branches, and paths.
-
-    Returns:
-        List of (folder_name, branch_name, worktree_path) tuples.
-        Excludes the .bare directory itself.
-    """
-    bare_dir = repo_root / ".bare"
-    result = run_git(["worktree", "list"], cwd=str(bare_dir), check=False)
-
+    """Read actual paths and refs without whitespace-dependent table parsing."""
+    result = run_git(["worktree", "list", "--porcelain", "-z"], cwd=str(repo_root / ".bare"), check=False)
     worktrees = []
-    for line in result.split("\n"):
-        if not line.strip():
-            continue
-
-        parts = line.split()
-        if not parts:
-            continue
-
-        worktree_path = Path(parts[0])
-
-        # Skip the .bare directory itself
-        if worktree_path == bare_dir:
-            continue
-
-        folder_name = worktree_path.name
-
-        # Get branch name
-        try:
-            branch = run_git(
-                ["rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=str(worktree_path),
-                check=False
-            )
-            if not branch or branch == "HEAD":
-                branch = "(detached)"
-        except Exception:
-            branch = "(unknown)"
-
-        worktrees.append((folder_name, branch, str(worktree_path)))
-
+    path = None
+    branch = "(detached)"
+    bare = False
+    for field in result.split("\0") + [""]:
+        if field.startswith("worktree "):
+            path, branch, bare = field[9:], "(detached)", False
+        elif field.startswith("branch refs/heads/"):
+            branch = field.removeprefix("branch refs/heads/")
+        elif field == "bare":
+            bare = True
+        elif not field and path:
+            if not bare and Path(path) != repo_root / ".bare":
+                worktrees.append((Path(path).name, branch, path))
+            path = None
     return worktrees
 
 
@@ -2036,46 +1269,6 @@ def is_commit_on_remote_ref(branch: str, local_commit: str, remote_ref: str, bar
     return merge_base == local_commit
 
 
-def print_stack_layers(folder_name: str, status_msg: str, view: dict, number: Optional[int]) -> bool:
-    """Print a stack worktree as an ordered layer list; report if it needs attention."""
-    layers = view.get("branches", [])
-    current = view.get("currentBranch", "")
-    position = next(
-        (index for index, layer in enumerate(layers, start=1) if layer.get("name") == current),
-        None,
-    )
-
-    heading = f"#{number} - " if number else ""
-    position_msg = f", on layer {position}" if position else ""
-    layer_word = "layer" if len(layers) == 1 else "layers"
-    print(folder_name)
-    print(f"  Stack: {heading}{len(layers)} {layer_word}{position_msg}")
-    print(f"  Status: {status_msg}")
-    print("  Layers:")
-
-    width = max((len(layer.get("name", "")) for layer in layers), default=0)
-    needs_attention = False
-
-    for index, layer in enumerate(layers, start=1):
-        name = layer.get("name", "")
-        pr = layer.get("pr")
-        if pr:
-            state = "MERGED" if layer.get("isMerged") else pr.get("state", "")
-            pr_msg = f"#{pr.get('number')} ({state})"
-        else:
-            pr_msg = "(no PR)"
-
-        # No "current" marker: every layer is checked out in its own worktree,
-        # so pointing at the host's branch would read as the others being away.
-        marker_msg = ""
-        if layer.get("needsRebase"):
-            marker_msg = "   <- needs rebase"
-            needs_attention = True
-        print(f"    {index}  {name.ljust(width)} {pr_msg}{marker_msg}")
-
-    return needs_attention
-
-
 def cmd_status(args):
     """Show status of all worktrees."""
     repo_root = get_repo_root()
@@ -2083,209 +1276,169 @@ def cmd_status(args):
         print("Error: Not in a bare-git repository", file=sys.stderr)
         sys.exit(2)
 
-    bare_dir = repo_root / ".bare"
+    worktrees = get_worktree_branches(repo_root)
+    stacks, errors = discover_stacks(repo_root, worktrees)
+    needs_attention = bool(errors)
+    owners = {branch: path for _, branch, path in worktrees}
+    for error in errors:
+        print(f"Stack information unavailable: {error}")
+    grouped = set()
+    membership = {}
+    for view in stacks:
+        for layer in view["branches"]:
+            membership.setdefault(layer["name"], []).append(stack_identity(view))
+    for view in stacks:
+        print(f"Stack: {view['branches'][0]['name']} (trunk: {view['trunk']})")
+        for layer in view["branches"]:
+            branch = layer["name"]
+            path = owners.get(branch)
+            pr = layer.get("pr")
+            pr_msg = f"#{pr['number']} ({pr.get('state', 'unknown')})" if pr else "(no PR)"
+            if path:
+                result = run_git_result(["status", "--porcelain"], cwd=path)
+                status_msg = "Clean" if not result.stdout.strip() else "uncommitted changes"
+                if result.returncode:
+                    status_msg = "status unavailable"
+                needs_attention |= status_msg != "Clean"
+                grouped.add(branch)
+            else:
+                status_msg = "no worktree"
+            if len(membership[branch]) > 1:
+                status_msg += "; ambiguous stack membership"
+                needs_attention = True
+            if layer.get("needsRebase"):
+                status_msg += "; needs rebase"
+                needs_attention = True
+            print(f"  Branch: {branch}  PR: {pr_msg}")
+            print(f"    Path: {path or '(missing)'}  Status: {status_msg}")
+        print()
+    for folder_name, branch, path in worktrees:
+        if branch in grouped:
+            continue
+        worktree_path = Path(path)
+        result = run_git_result(["status", "--porcelain"], cwd=path)
+        status_msg = "Clean" if not result.stdout.strip() else f"{len(result.stdout.splitlines())} uncommitted changes"
+        if result.returncode:
+            status_msg = "(unknown)"
+        needs_attention |= status_msg != "Clean"
 
-    # Get worktree list
-    result = run_git(["worktree", "list"], cwd=str(bare_dir), check=False)
-    if not result:
-        print("No worktrees found.")
-        sys.exit(0)
+        # Get ahead/behind origin
+        origin_msg = ""
+        branch_deleted = False
+        if branch and branch != "(detached)" and branch != "(unknown)":
+            try:
+                ahead = int(run_git(
+                    ["rev-list", "--count", f"origin/{branch}..HEAD"],
+                    cwd=str(worktree_path),
+                    check=False
+                ) or "0")
+                behind = int(run_git(
+                    ["rev-list", "--count", f"HEAD..origin/{branch}"],
+                    cwd=str(worktree_path),
+                    check=False
+                ) or "0")
 
-    needs_attention = False
-
-    # Parse worktree list and show details for each
-    for line in result.split("\n"):
-        if line.strip():
-            # Worktree path is first column, may have tab-separated branch info
-            parts = line.split()
-            if parts:
-                worktree_path = Path(parts[0])
-
-                # Skip the .bare directory itself (it's the bare repo, not a worktree)
-                if worktree_path == bare_dir:
-                    continue
-
-                folder_name = worktree_path.name
-
-                # Get branch name from worktree
-                try:
-                    branch = run_git(
-                        ["rev-parse", "--abbrev-ref", "HEAD"],
+                if ahead > 0 and behind > 0:
+                    origin_msg = f"{ahead} ahead / {behind} behind origin"
+                    needs_attention = True
+                elif ahead > 0:
+                    origin_msg = f"{ahead} commits ahead of origin"
+                elif behind > 0:
+                    origin_msg = f"{behind} commits behind origin"
+                    needs_attention = True
+                else:
+                    # Check if remote branch exists
+                    remote_check = run_git(
+                        ["ls-remote", "origin", f"refs/heads/{branch}"],
                         cwd=str(worktree_path),
                         check=False
                     )
-                    if not branch or branch == "HEAD":
-                        branch = "(detached)"
-                except Exception:
-                    branch = "(unknown)"
-
-                # Get uncommitted changes
-                try:
-                    status_output = run_git(
-                        ["status", "--porcelain"],
-                        cwd=str(worktree_path),
-                        check=False
-                    )
-                    if status_output.strip():
-                        # Count changes
-                        lines = [l for l in status_output.split("\n") if l.strip()]
-                        status_msg = f"{len(lines)} uncommitted changes"
-                        needs_attention = True
+                    if remote_check.strip():
+                        origin_msg = "Up to date"
                     else:
-                        status_msg = "Clean"
-                except Exception:
-                    status_msg = "(unknown)"
-
-                # A stack renders once, under its container. Layers above the
-                # bottom carry no metadata, so they are skipped here and listed
-                # by the host instead of appearing as worktrees of their own.
-                metadata = read_stack_metadata(worktree_path)
-                if not metadata and find_host_beside(worktree_path):
-                    continue
-
-                if metadata:
-                    stack_view = get_stack_view(worktree_path)
-                    if stack_view:
-                        container = worktree_path.parent
-                        heading = (
-                            container.name if container != repo_root else folder_name
+                        # Check if branch was ever pushed
+                        local_ref = run_git(
+                            ["rev-parse", "--abbrev-ref", branch + "@{upstream}"],
+                            cwd=str(worktree_path),
+                            check=False
                         )
-                        if print_stack_layers(
-                            heading, status_msg, stack_view, stack_number(metadata)
-                        ):
-                            needs_attention = True
-                        print()
-                        continue
-
-                # Get ahead/behind origin
-                origin_msg = ""
-                branch_deleted = False
-                if branch and branch != "(detached)" and branch != "(unknown)":
-                    try:
-                        ahead = int(run_git(
-                            ["rev-list", "--count", f"origin/{branch}..HEAD"],
-                            cwd=str(worktree_path),
-                            check=False
-                        ) or "0")
-                        behind = int(run_git(
-                            ["rev-list", "--count", f"HEAD..origin/{branch}"],
-                            cwd=str(worktree_path),
-                            check=False
-                        ) or "0")
-
-                        if ahead > 0 and behind > 0:
-                            origin_msg = f"{ahead} ahead / {behind} behind origin"
-                            needs_attention = True
-                        elif ahead > 0:
-                            origin_msg = f"{ahead} commits ahead of origin"
-                        elif behind > 0:
-                            origin_msg = f"{behind} commits behind origin"
+                        if local_ref:
+                            branch_deleted = True
+                            origin_msg = "Branch deleted on remote"
                             needs_attention = True
                         else:
-                            # Check if remote branch exists
-                            remote_check = run_git(
-                                ["ls-remote", "origin", f"refs/heads/{branch}"],
-                                cwd=str(worktree_path),
-                                check=False
-                            )
-                            if remote_check.strip():
-                                origin_msg = "Up to date"
-                            else:
-                                # Check if branch was ever pushed
-                                local_ref = run_git(
-                                    ["rev-parse", "--abbrev-ref", branch + "@{upstream}"],
-                                    cwd=str(worktree_path),
-                                    check=False
-                                )
-                                if local_ref:
-                                    branch_deleted = True
-                                    origin_msg = "Branch deleted on remote"
-                                    needs_attention = True
-                                else:
-                                    origin_msg = "(no upstream configured)"
-                    except Exception:
-                        origin_msg = "(no upstream configured)"
+                            origin_msg = "(no upstream configured)"
+            except Exception:
+                origin_msg = "(no upstream configured)"
 
-                # Get PR info
-                pr_msg = "Not found"
-                if branch and not branch.startswith("("):
-                    pr_info = get_pr_info(branch)
-                    if pr_info:
-                        if "error" in pr_info:
-                            pr_msg = f"({pr_info['error']})"
-                        else:
-                            state = pr_info['state']
-                            if state == 'OPEN' and pr_info.get('isDraft'):
-                                state = 'DRAFT'
-                            pr_msg = f"#{pr_info['number']} ({state}) - {pr_info['url']}"
-                            if state == 'MERGED':
-                                branch_deleted = True
+        # Get PR info
+        pr_msg = "Not found"
+        if branch and not branch.startswith("("):
+            pr_info = get_pr_info(branch)
+            if pr_info:
+                if "error" in pr_info:
+                    pr_msg = f"({pr_info['error']})"
+                else:
+                    state = pr_info['state']
+                    if state == 'OPEN' and pr_info.get('isDraft'):
+                        state = 'DRAFT'
+                    pr_msg = f"#{pr_info['number']} ({state}) - {pr_info['url']}"
+                    if state == 'MERGED':
+                        branch_deleted = True
 
-                print(f"{folder_name}")
-                print(f"  Branch: {branch}")
-                print(f"  Status: {status_msg}")
-                if origin_msg:
-                    print(f"  Origin: {origin_msg}")
-                print(f"  PR: {pr_msg}")
-                print()
+        print(f"{folder_name}")
+        print(f"  Path: {worktree_path}")
+        print(f"  Branch: {branch}")
+        print(f"  Status: {status_msg}")
+        if origin_msg:
+            print(f"  Origin: {origin_msg}")
+        print(f"  PR: {pr_msg}")
+        print()
+
 
     sys.exit(1 if needs_attention else 0)
 
 
-STACK_USAGE = """\
-gh wt stack [NAME] [-f]
-       gh wt stack add NAME [-L]
-       gh wt stack rename OLD NEW [-f]
-       gh wt stack rebase [--no-trunk | --continue]
-       gh wt stack agent"""
-
-STACK_VERBS = ("add", "rename", "rebase", "agent")
+REMOVED_STACK_GUIDANCE = (
+    "Conversion and grouped layouts were removed. Use gh stack init or gh stack link, "
+    "then gh stack checkout <stack> and gh wt stack setup. "
+    "Use gh stack rebase directly for history and recovery."
+)
 
 
-def parse_stack_verb(verb: str, argv: list[str]) -> argparse.Namespace:
-    """Parse `gh wt stack <verb> ...` into the namespace the old flags produce.
-
-    The verbs are reserved words in the spot where layer 1's name goes, so
-    they are split off before the stack parser, which would read them as NAME.
-    """
-    parser = argparse.ArgumentParser(prog=f"gh wt stack {verb}", allow_abbrev=False)
-    if verb == "add":
-        parser.add_argument("add", metavar="NAME",
-                            help="Name for the new layer; it is numbered for you")
-        parser.add_argument("-L", "--local", action="store_true",
-                            help="Create the layer locally without pushing to origin")
-    elif verb == "rename":
-        parser.add_argument("rename", nargs=2, metavar=("OLD", "NEW"),
-                            help="Layer folder names, e.g. 01 01-base")
-        parser.add_argument("-f", "--force", action="store_true",
-                            help="Rename even when it will close an open PR")
-    elif verb == "rebase":
-        parser.add_argument("--continue", dest="rebase_continue", action="store_true",
-                            help="Finish a rebase that stopped on a conflict")
-        parser.add_argument("--no-trunk", action="store_true",
-                            help="Cascade layers onto each other without pulling trunk")
-
-    args = argparse.Namespace(
-        command="stack", name=None, force=False, add=None, local=False, rename=None,
-        rebase=verb == "rebase", rebase_continue=False, no_trunk=False, agent=verb == "agent",
-    )
-    return parser.parse_args(argv, namespace=args)
+def parse_stack_command(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="gh wt stack", description=REMOVED_STACK_GUIDANCE,
+                                     allow_abbrev=False)
+    commands = parser.add_subparsers(dest="stack_command")
+    setup = commands.add_parser("setup", help="Create missing worktrees for the current tracked stack", allow_abbrev=False)
+    setup.add_argument("--dry-run", action="store_true", help="Preview without creating worktrees or running hooks")
+    add = commands.add_parser("add", help="Add a new top layer with a flat worktree", allow_abbrev=False)
+    add.add_argument("name")
+    add.add_argument("-L", "--local", action="store_true", help="Keep the new branch local")
+    commands.add_parser("agent", help="Print static stack guidance")
+    if argv and argv[0] not in ("setup", "add", "agent", "-h", "--help"):
+        parser.error(REMOVED_STACK_GUIDANCE)
+    args = parser.parse_args(argv)
+    if not args.stack_command:
+        parser.print_help()
+    return args
 
 
 def cli(argv: list[str] | None = None):
     """Entry point. Parses argv and dispatches to subcommand."""
     if argv is None:
         argv = sys.argv[1:]
-    if len(argv) > 1 and argv[0] == "stack" and argv[1] in STACK_VERBS:
-        args = parse_stack_verb(argv[1], argv[2:])
-        check_current_dir()
-        cmd_stack(args)
+    if argv and argv[0] == "stack":
+        args = parse_stack_command(argv[1:])
+        if args.stack_command:
+            check_current_dir()
+            cmd_stack(args)
         return
 
     parser = argparse.ArgumentParser(
         prog="gh-wt",
         description="Manage bare-git worktrees.",
-        epilog="Stacked PRs: run 'gh wt stack' inside a worktree. Agents: gh wt stack agent",
+        epilog="Tracked stacks: gh wt stack setup. History and PRs: gh stack.",
         allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="command")
@@ -2319,35 +1472,12 @@ def cli(argv: list[str] | None = None):
     p_rm.add_argument("-f", "--force", action="store_true",
                       help="Force removal even with untracked/unpushed files")
 
+    p_rm.add_argument("--keep-branch", action="store_true", help="Remove only the worktree, retaining its local branch")
+    p_rm.add_argument("--dry-run", action="store_true", help="Preview eligible removal targets without changing anything")
+
     subparsers.add_parser("status", help="Show status of all worktrees")
 
-    p_stack = subparsers.add_parser(
-        "stack", help="Convert this worktree into the host for a stack of PRs",
-        usage=STACK_USAGE,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "subcommands:\n"
-            "  add NAME         Add a layer on top of the stack, in its own worktree\n"
-            "  rename OLD NEW   Rename a layer's folder, branch, and metadata\n"
-            "  rebase           Cascade the stack, freeing layer worktrees first\n"
-            "  agent            Print the layer-splitting procedure for AI agents\n"
-            "\n"
-            "add, rename, rebase, and agent are reserved: they cannot name layer 1."
-        ),
-    )
-    p_stack.add_argument("name", nargs="?", default=None,
-                         help="Name for layer 1 (default: unnamed, folder '01')")
-    p_stack.add_argument("-f", "--force", action="store_true",
-                         help="Rename even when it will close an open PR")
-    # The flag spellings predate the subcommands and stay as hidden aliases.
-    p_stack.add_argument("-n", "--add", default=None, help=argparse.SUPPRESS)
-    p_stack.add_argument("-L", "--local", action="store_true", help=argparse.SUPPRESS)
-    p_stack.add_argument("--rename", nargs=2, default=None, help=argparse.SUPPRESS)
-    p_stack.add_argument("--rebase", action="store_true", help=argparse.SUPPRESS)
-    p_stack.add_argument("--continue", dest="rebase_continue", action="store_true",
-                         help=argparse.SUPPRESS)
-    p_stack.add_argument("--no-trunk", action="store_true", help=argparse.SUPPRESS)
-    p_stack.add_argument("--agent", action="store_true", help=argparse.SUPPRESS)
+    subparsers.add_parser("stack", help="Set up independent worktrees for native gh stack")
 
     args = parser.parse_args(argv)
 

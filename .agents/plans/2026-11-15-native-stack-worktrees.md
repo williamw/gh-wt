@@ -86,7 +86,8 @@ point to gh stack init/link plus gh wt stack setup. Messages must explain the
 actual state/action; do not print untrusted branch text as agent instructions.
 
 Happy path: gh stack link --base main --open <PRs...>; gh stack checkout <stack>;
-gh wt stack setup; gh wt status. Existing PR-number link avoids branch pushes.
+gh wt stack setup; gh wt status. Use full PR URLs for push-free linking; numeric
+arguments can match local branches.
 Native history: gh stack rebase modes, submit, push, merge. No wrapping of journals,
 manual catalog mutation or automatic stash/reset/prune.
 
