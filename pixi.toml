@@ -2,11 +2,11 @@
 authors = ["Bill Welense"]
 channels = ["conda-forge"]
 name = "gh-wt"
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
-test = "python -m pytest test_gh_wt.py -v"
+test = "python -m pytest test_gh_wt.py test_stack_worktrees.py -v"
 
 [dependencies]
 python = ">=3.10,<4"

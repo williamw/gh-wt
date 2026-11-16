@@ -1,0 +1,8 @@
+#!/bin/sh
+# Expose only local gh-stack operations. Tests cannot contact a GitHub account.
+if [ "$1" = stack ]; then
+    shift
+    exec /usr/local/bin/gh-stack "$@"
+fi
+printf '%s\n' 'GitHub network operations are disabled in this test environment.' >&2
+exit 1
