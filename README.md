@@ -237,7 +237,7 @@ stay where they are.
 Adopt existing PRs by full URL without pushing their branches:
 
 ```bash
-gh stack link --base main --open https://github.com/owner/repo/pull/123 https://github.com/owner/repo/pull/124
+gh stack link --base main https://github.com/owner/repo/pull/123 https://github.com/owner/repo/pull/124
 gh stack checkout <stack>
 gh wt stack setup --dry-run
 gh wt stack setup
@@ -247,6 +247,9 @@ gh wt status
 Use full PR URLs for this flow. In gh stack 0.3.0, a numeric argument is first
 checked as a local branch name; if that branch exists, `link` treats it as a
 branch and may push it instead of looking up the PR number.
+
+Leave `--open` off when adopting existing PRs unless you intend to mark every
+draft in the stack ready for review.
 
 For local branches, use `gh stack init --base main <bottom> <next> ...`
 to establish the stack first. Run setup from a branch belonging to that tracked
@@ -296,8 +299,12 @@ Coordinate affected agents before native history changes:
 ```bash
 gh stack rebase --upstack --no-trunk  # cascade layers above the current fix
 gh stack push
-gh stack submit --auto --open
+gh stack submit --auto
 ```
+
+To mark only a new layer's PR ready for review, follow submission with
+`gh pr ready <new-layer-PR-URL>`. Add `--open` to `submit` only when you intend to
+mark every draft in the stack ready.
 
 `--upstack` limits the cascade to layers above the current branch. `--no-trunk`
 alone skips fetching and rebasing with trunk but still rebases all stack layers
